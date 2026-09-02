@@ -172,6 +172,43 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 # the router config that monolithic apply() cannot carry.
                 self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
+    def rebuild_moe_kernel(self, layer: "RoutedExperts") -> None:
+        """Re-select the experts class and rebuild the kernel around it.
+
+        Deliberately does NOT call ``convert_to_unquantized_kernel_format``:
+        TRITON and BATCHED_TRITON both fall through it unchanged, so the
+        weights on the device already suit either. Only that pair is allowed --
+        the FlashInfer and AITER backends do reshape weights at load time, and
+        swapping into one of those without reconverting would run the right
+        bytes through the wrong kernel.
+        """
+        backend, experts_cls = select_unquantized_moe_backend(moe_config=self.moe)
+        switchable = {
+            UnquantizedMoeBackend.TRITON,
+            UnquantizedMoeBackend.BATCHED_TRITON,
+        }
+        if backend != self.unquantized_backend and not {
+            backend,
+            self.unquantized_backend,
+        } <= switchable:
+            raise ValueError(
+                f"Cannot switch unquantized MoE backend "
+                f"{self.unquantized_backend.value} -> {backend.value} in "
+                f"place: they do not share a weight layout."
+            )
+
+        self.unquantized_backend = backend
+        self.experts_cls = experts_cls
+        assert self.moe_quant_config is not None
+        assert self.experts_cls is not None
+        self.moe_kernel = make_unquantized_moe_kernel(
+            quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            backend=self.unquantized_backend,
+            experts_cls=self.experts_cls,
+            routing_tables=layer._expert_routing_tables(),
+        )
+
     def process_weights_after_loading(self, layer: "RoutedExperts") -> None:
         super().process_weights_after_loading(layer)
 

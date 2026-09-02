@@ -564,6 +564,36 @@ def convert_to_fp8_moe_kernel_format(
     return w13, w2, w13_scale, w2_scale
 
 
+# Backends whose standard and batched variants take the same branch of
+# convert_to_fp8_moe_kernel_format above, and therefore consume the same
+# on-device weight layout. Only these pairs can be swapped after loading.
+_SAME_WEIGHT_LAYOUT_PAIRS = (
+    frozenset({Fp8MoeBackend.DEEPGEMM, Fp8MoeBackend.BATCHED_DEEPGEMM}),
+    frozenset({Fp8MoeBackend.TRITON, Fp8MoeBackend.BATCHED_TRITON}),
+    frozenset({Fp8MoeBackend.VLLM_CUTLASS, Fp8MoeBackend.BATCHED_VLLM_CUTLASS}),
+)
+
+
+def assert_same_fp8_weight_layout(
+    old: Fp8MoeBackend, new: Fp8MoeBackend
+) -> None:
+    """Refuse a backend change that would need weights in a different layout.
+
+    P/D role switching rebuilds the MoE kernel around weights already on the
+    device. Moving between the standard and batched variants of one backend is
+    safe because they share a layout; any other move is not, and silently
+    running the wrong kernel over the right bytes produces plausible garbage
+    rather than an error.
+    """
+    if old == new or frozenset({old, new}) in _SAME_WEIGHT_LAYOUT_PAIRS:
+        return
+    raise ValueError(
+        f"Cannot switch FP8 MoE backend {old.value} -> {new.value} in place: "
+        f"they do not share a weight layout, so the weights on the device "
+        f"would have to be reconverted."
+    )
+
+
 def make_fp8_moe_quant_config(
     fp8_backend: Fp8MoeBackend,
     w1_scale: torch.Tensor,

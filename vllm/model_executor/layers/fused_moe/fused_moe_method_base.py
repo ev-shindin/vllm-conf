@@ -38,6 +38,25 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # completed migration to the new internal MK interface.
         return self.moe_kernel is not None
 
+    def rebuild_moe_kernel(self, layer) -> None:
+        """Rebuild this layer's MoE kernel for the current all2all backend.
+
+        Called by P/D role switching after ``all2all_backend`` has been flipped
+        on the parallel config, to re-select the experts class for the new
+        activation format (Standard vs BatchedExperts) and rebuild the
+        prepare/finalize pair around it.
+
+        Implementations must NOT touch weights. The batched and standard
+        variants of one backend share a weight layout, which is what allows the
+        switch to be cheap; re-running the load-time format conversion would
+        both cost a full-size allocation and re-process weights that are
+        already in kernel format.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support rebuilding its MoE kernel "
+            f"for a different all2all backend."
+        )
+
     @property
     def mk_can_overlap_shared_experts(self) -> bool:
         # NOTE(rob): temporary attribute to indicate support for
