@@ -124,9 +124,14 @@ def ll_max_tokens_cap() -> int:
     return ((depth // 2 - 1) // 4) * 4
 
 
-def _scheduler_token_budget() -> int | None:
-    """The scheduler's per-step token budget, as this process sees it."""
-    config = get_current_vllm_config_or_none()
+def _scheduler_token_budget(config) -> int | None:
+    """The scheduler's per-step token budget, from an explicit config.
+
+    Takes the config rather than reaching for the ambient one: this is
+    called from check_switchable, which runs before the caller establishes
+    a set_current_vllm_config context, so the ambient lookup returns None
+    and the check quietly passes everything.
+    """
     if config is None or config.scheduler_config is None:
         return None
     return config.scheduler_config.max_num_batched_tokens
@@ -171,7 +176,10 @@ def _moe_layers(model: torch.nn.Module) -> list[torch.nn.Module]:
 
 
 def check_switchable(
-    model: torch.nn.Module, backend: str, max_num_tokens: int | None = None
+    model: torch.nn.Module,
+    backend: str,
+    max_num_tokens: int | None = None,
+    config=None,
 ) -> list[torch.nn.Module]:
     """Validate the switch and return the layers it would touch.
 
@@ -181,7 +189,7 @@ def check_switchable(
     """
     if backend == LOW_LATENCY and max_num_tokens is not None:
         cap = ll_max_tokens_cap()
-        scheduled = _scheduler_token_budget()
+        scheduled = _scheduler_token_budget(config)
         if scheduled is not None and max_num_tokens < scheduled:
             raise RoleSwitchError(
                 f"max_num_tokens={max_num_tokens} is below the scheduler's "
@@ -337,18 +345,18 @@ def switch_all2all_backend(
     tokens x hidden x experts, so on a large MoE it would pin more memory
     than the faster switch back is worth.
     """
-    layers = check_switchable(model, backend, max_num_tokens)
-    current = layers[0].moe_config.moe_parallel_config.all2all_backend
-    if current == backend:
-        logger.info("role switch: already on %s, nothing to do", backend)
-        return 0
-
     config = vllm_config or get_current_vllm_config_or_none()
     if config is None:
         raise RoleSwitchError(
             "No VllmConfig available. Pass vllm_config=: the MoE kernel "
             "rebuild reads it, and a worker RPC has no ambient config."
         )
+
+    layers = check_switchable(model, backend, max_num_tokens, config)
+    current = layers[0].moe_config.moe_parallel_config.all2all_backend
+    if current == backend:
+        logger.info("role switch: already on %s, nothing to do", backend)
+        return 0
 
     if max_num_tokens is None:
         if backend == LOW_LATENCY:
