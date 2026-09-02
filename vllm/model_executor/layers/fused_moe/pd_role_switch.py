@@ -124,6 +124,14 @@ def ll_max_tokens_cap() -> int:
     return ((depth // 2 - 1) // 4) * 4
 
 
+def _scheduler_token_budget() -> int | None:
+    """The scheduler's per-step token budget, as this process sees it."""
+    config = get_current_vllm_config_or_none()
+    if config is None or config.scheduler_config is None:
+        return None
+    return config.scheduler_config.max_num_batched_tokens
+
+
 class RoleSwitchError(RuntimeError):
     """The engine cannot switch backends. Raised before anything is mutated."""
 
@@ -173,18 +181,32 @@ def check_switchable(
     """
     if backend == LOW_LATENCY and max_num_tokens is not None:
         cap = ll_max_tokens_cap()
+        scheduled = _scheduler_token_budget()
+        if scheduled is not None and max_num_tokens < scheduled:
+            raise RoleSwitchError(
+                f"max_num_tokens={max_num_tokens} is below the scheduler's "
+                f"budget of {scheduled}, so the scheduler could dispatch more "
+                f"tokens than the buffer holds. Lowering it here is not "
+                f"enough: v1 Scheduler caches max_num_scheduled_tokens at "
+                f"init and runs in EngineCore, not in this worker. Lower "
+                f"max_num_batched_tokens for the decode role there first."
+            )
         if max_num_tokens % 4 != 0:
             raise RoleSwitchError(
                 f"max_num_tokens={max_num_tokens} must be a multiple of 4: "
                 f"DeepEP LL dispatch asserts (num_ranks * n) % 4 == 0 for TMA."
             )
         if max_num_tokens > cap:
+            needed = (max_num_tokens + 1) * 2
             raise RoleSwitchError(
                 f"max_num_tokens={max_num_tokens} exceeds the DeepEP LL cap "
-                f"of {cap} (NVSHMEM_QP_DEPTH // 2 - 1). Beyond it every "
-                f"dispatch fails an assert inside deep_ep. Raise "
-                f"NVSHMEM_QP_DEPTH before the engine starts, or lower the "
-                f"decode token budget."
+                f"of {cap}. Beyond it every dispatch fails an assert inside "
+                f"deep_ep. Set NVSHMEM_QP_DEPTH>={needed} in the environment "
+                f"BEFORE the engine starts -- deep_ep reads it once, when it "
+                f"builds its first buffer -- or lower max_num_batched_tokens. "
+                f"Clamping here is not an option: a bound below what the "
+                f"scheduler may dispatch is what the assert is protecting "
+                f"against."
             )
 
     if backend not in SWITCHABLE_BACKENDS:
@@ -230,13 +252,14 @@ def check_switchable(
     return layers
 
 
-def _swap_all2all_manager(backend: str):
+def _swap_all2all_manager(backend: str, keep_previous: bool):
     """Point the EP group's device communicator at ``backend``'s manager.
 
-    The outgoing manager is returned, still alive and still holding its
-    symmetric buffer. Destroying it would make switching back cost a fresh
-    NVSHMEM allocation and rendezvous; keeping it costs ~1.3 GiB (HT) or
-    ~3.2 GiB (LL), which is the whole point of preferring this over a restart.
+    The outgoing manager is returned so the caller can destroy it once every
+    layer has been rebuilt against the new one. Keeping it makes switching
+    back free of a fresh NVSHMEM rendezvous, but the buffer scales with
+    tokens x hidden x experts -- ~3.2 GiB on two GPUs, ~13 GiB at a large
+    MoE's shape -- so holding it is only worth it when it is small.
     """
     from vllm.distributed.device_communicators.all2all import (
         DeepEPHTAll2AllManager,
@@ -253,6 +276,11 @@ def _swap_all2all_manager(backend: str):
         device_communicator._role_switch_managers = cached
     # The manager the engine booted with was never put in the cache by us.
     cached.setdefault(device_communicator.all2all_backend, previous)
+
+    if not keep_previous:
+        # Do not leave a manager in the cache that the caller is about to
+        # destroy; a later switch back must build a fresh one.
+        cached.pop(device_communicator.all2all_backend, None)
 
     manager = cached.get(backend)
     if manager is None:
@@ -281,6 +309,7 @@ def switch_all2all_backend(
     backend: str,
     vllm_config=None,
     max_num_tokens: int | None = None,
+    keep_previous: bool = False,
 ) -> int:
     """Move this engine to ``backend``. Returns the number of layers switched.
 
@@ -300,8 +329,13 @@ def switch_all2all_backend(
     every dispatch. Leaving an engine's prefill-sized budget in place builds
     a buffer too small for the value it is then handed, and the first forward
     pass after the switch dies inside deep_ep with a bare AssertionError.
-    Defaults to ``max_num_seqs`` for LL -- in decode a step carries about one
-    token per running sequence -- and restores the launch value for HT.
+    Defaults to the scheduler's own token budget and restores the launch
+    value for HT.
+
+    ``keep_previous`` retains the outgoing manager so a switch back needs no
+    fresh NVSHMEM rendezvous. Off by default: the buffer scales with
+    tokens x hidden x experts, so on a large MoE it would pin more memory
+    than the faster switch back is worth.
     """
     layers = check_switchable(model, backend, max_num_tokens)
     current = layers[0].moe_config.moe_parallel_config.all2all_backend
@@ -318,12 +352,13 @@ def switch_all2all_backend(
 
     if max_num_tokens is None:
         if backend == LOW_LATENCY:
-            # A decode step carries about one token per running sequence, but
-            # DeepEP LL caps what it will dispatch, and the default cap (511)
-            # is below vLLM's default max_num_seqs (1024).
-            max_num_tokens = min(
-                config.scheduler_config.max_num_seqs, ll_max_tokens_cap()
-            )
+            # max_num_batched_tokens is the scheduler's cap on tokens per
+            # step, and speculative decoding is charged against it, so it
+            # already covers MTP where max_num_seqs would not. Rounded up,
+            # never down: a buffer smaller than what the scheduler may
+            # dispatch is the failure this whole path kept hitting.
+            budget = config.scheduler_config.max_num_batched_tokens
+            max_num_tokens = ((budget + 3) // 4) * 4
         else:
             max_num_tokens = getattr(
                 layers[0], "_role_switch_boot_max_num_tokens", None
@@ -335,11 +370,17 @@ def switch_all2all_backend(
         # answer -- and a refusal discovered mid-rebuild would leave the
         # manager swapped and some layers already switched.
         _precheck_rebuild(layers, backend)
-        _swap_all2all_manager(backend)
+        previous = _swap_all2all_manager(backend, keep_previous)
         # Flip the engine-wide config too, so anything constructed after this
         # point agrees with the layers that were just rebuilt.
         config.parallel_config.all2all_backend = backend
         switched = _rebuild_layers(layers, backend, max_num_tokens)
+        if not keep_previous and previous is not None:
+            # Only now is nothing holding one of its handles.
+            previous.destroy()
+            logger.info(
+                "role switch: destroyed %s", type(previous).__name__
+            )
 
     logger.info(
         "role switch: %s -> %s across %d MoE layers, weights untouched",
