@@ -690,7 +690,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             routing_tables=layer._expert_routing_tables(),
         )
 
-    def rebuild_moe_kernel(self, layer: RoutedExperts) -> None:
+    def rebuild_moe_kernel(
+        self, layer: RoutedExperts, dry_run: bool = False
+    ) -> None:
         """Re-select the experts class and rebuild the kernel around it.
 
         Deliberately does NOT call ``convert_to_fp8_moe_kernel_format``: the
@@ -712,6 +714,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # unrelated backend would imply a different weight layout, and the
             # weights are not being reconverted.
             assert_same_fp8_weight_layout(self.fp8_backend, backend)
+
+        if dry_run:
+            return
 
         self.fp8_backend = backend
         self.experts_cls = experts_cls

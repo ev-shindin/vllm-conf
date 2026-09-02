@@ -172,7 +172,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 # the router config that monolithic apply() cannot carry.
                 self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
-    def rebuild_moe_kernel(self, layer: "RoutedExperts") -> None:
+    def rebuild_moe_kernel(
+        self, layer: "RoutedExperts", dry_run: bool = False
+    ) -> None:
         """Re-select the experts class and rebuild the kernel around it.
 
         Deliberately does NOT call ``convert_to_unquantized_kernel_format``:
@@ -196,6 +198,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 f"{self.unquantized_backend.value} -> {backend.value} in "
                 f"place: they do not share a weight layout."
             )
+
+        if dry_run:
+            return
 
         self.unquantized_backend = backend
         self.experts_cls = experts_cls

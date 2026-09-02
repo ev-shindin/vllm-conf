@@ -590,7 +590,11 @@ def assert_same_fp8_weight_layout(
     raise ValueError(
         f"Cannot switch FP8 MoE backend {old.value} -> {new.value} in place: "
         f"they do not share a weight layout, so the weights on the device "
-        f"would have to be reconverted."
+        f"would have to be reconverted. Backends are picked per activation "
+        f"format, and the auto choice for one role may have no batched "
+        f"counterpart -- on Hopper with block-FP8 and EP, vLLM prefers "
+        f"FLASHINFER_CUTLASS, which does convert layout. Pin moe_backend to "
+        f"deepgemm or triton so both roles use a layout-sharing pair."
     )
 
 

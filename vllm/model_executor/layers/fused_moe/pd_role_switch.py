@@ -84,9 +84,11 @@ dispatch path is torn down and rebuilt, so a forward pass spanning the switch
 would use half of each backend.
 """
 
+import os
+
 import torch
 
-from vllm.config import get_current_vllm_config_or_none
+from vllm.config import get_current_vllm_config_or_none, set_current_vllm_config
 from vllm.distributed import get_ep_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -100,6 +102,26 @@ logger = init_logger(__name__)
 HIGH_THROUGHPUT = "deepep_high_throughput"
 LOW_LATENCY = "deepep_low_latency"
 SWITCHABLE_BACKENDS = (HIGH_THROUGHPUT, LOW_LATENCY)
+
+
+def ll_max_tokens_cap() -> int:
+    """Largest per-rank dispatch bound DeepEP LL will accept.
+
+    Two constraints, both of which fail as bare assertions deep inside a
+    dispatch rather than at construction:
+
+    * ``nvshmem_qp_depth >= (n + 1) * 2``, and the depth is read once from
+      NVSHMEM_QP_DEPTH (default 1024) when deep_ep builds its first buffer,
+      so it is fixed at engine boot and cannot be raised by a later switch.
+    * ``(num_ranks * n) % 4 == 0``, for TMA. Keeping n itself a multiple of
+      4 satisfies this whatever num_ranks turns out to be, so the rule does
+      not need to know the EP world size.
+
+    Read from the same environment variable deep_ep reads, so the two agree
+    by construction rather than by a constant copied here that could drift.
+    """
+    depth = int(os.environ.get("NVSHMEM_QP_DEPTH", "1024"))
+    return ((depth // 2 - 1) // 4) * 4
 
 
 class RoleSwitchError(RuntimeError):
@@ -140,13 +162,31 @@ def _moe_layers(model: torch.nn.Module) -> list[torch.nn.Module]:
     return layers
 
 
-def check_switchable(model: torch.nn.Module, backend: str) -> list[torch.nn.Module]:
+def check_switchable(
+    model: torch.nn.Module, backend: str, max_num_tokens: int | None = None
+) -> list[torch.nn.Module]:
     """Validate the switch and return the layers it would touch.
 
     Raises before any mutation. A half-switched model has no way back short of
     a restart, so every reason to refuse is collected here rather than
     discovered layer by layer.
     """
+    if backend == LOW_LATENCY and max_num_tokens is not None:
+        cap = ll_max_tokens_cap()
+        if max_num_tokens % 4 != 0:
+            raise RoleSwitchError(
+                f"max_num_tokens={max_num_tokens} must be a multiple of 4: "
+                f"DeepEP LL dispatch asserts (num_ranks * n) % 4 == 0 for TMA."
+            )
+        if max_num_tokens > cap:
+            raise RoleSwitchError(
+                f"max_num_tokens={max_num_tokens} exceeds the DeepEP LL cap "
+                f"of {cap} (NVSHMEM_QP_DEPTH // 2 - 1). Beyond it every "
+                f"dispatch fails an assert inside deep_ep. Raise "
+                f"NVSHMEM_QP_DEPTH before the engine starts, or lower the "
+                f"decode token budget."
+            )
+
     if backend not in SWITCHABLE_BACKENDS:
         raise RoleSwitchError(
             f"Cannot switch to {backend!r}; supported: {list(SWITCHABLE_BACKENDS)}."
@@ -236,30 +276,116 @@ def _swap_all2all_manager(backend: str):
     return previous
 
 
-def switch_all2all_backend(model: torch.nn.Module, backend: str) -> int:
+def switch_all2all_backend(
+    model: torch.nn.Module,
+    backend: str,
+    vllm_config=None,
+    max_num_tokens: int | None = None,
+) -> int:
     """Move this engine to ``backend``. Returns the number of layers switched.
 
     Call on every rank, with no requests in flight.
+
+    ``vllm_config`` is required when there is no ambient config, which is the
+    normal case here: the switch is driven from a worker RPC, long after
+    model init left its ``set_current_vllm_config`` context. Parts of the
+    rebuild path still call ``get_current_vllm_config()`` unconditionally
+    (all2all_utils reads scheduler_config for some backends), so the rebuild
+    runs inside a restored context rather than hoping none of them fire.
+
+    ``max_num_tokens`` is the per-rank dispatch bound for the new role, and
+    moving it is not optional when switching to low latency: DeepEP LL sizes
+    its queue pairs from it and asserts
+    ``nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2`` on
+    every dispatch. Leaving an engine's prefill-sized budget in place builds
+    a buffer too small for the value it is then handed, and the first forward
+    pass after the switch dies inside deep_ep with a bare AssertionError.
+    Defaults to ``max_num_seqs`` for LL -- in decode a step carries about one
+    token per running sequence -- and restores the launch value for HT.
     """
-    layers = check_switchable(model, backend)
+    layers = check_switchable(model, backend, max_num_tokens)
     current = layers[0].moe_config.moe_parallel_config.all2all_backend
     if current == backend:
         logger.info("role switch: already on %s, nothing to do", backend)
         return 0
 
-    _swap_all2all_manager(backend)
+    config = vllm_config or get_current_vllm_config_or_none()
+    if config is None:
+        raise RoleSwitchError(
+            "No VllmConfig available. Pass vllm_config=: the MoE kernel "
+            "rebuild reads it, and a worker RPC has no ambient config."
+        )
 
-    # Flip the engine-wide config too, so anything constructed after this point
-    # agrees with the layers that were just rebuilt.
-    # _or_none: get_current_vllm_config() raises outside a
-    # set_current_vllm_config() context, and the switch is driven from a
-    # worker RPC that has no reason to be inside one.
-    vllm_config = get_current_vllm_config_or_none()
-    if vllm_config is not None:
-        vllm_config.parallel_config.all2all_backend = backend
+    if max_num_tokens is None:
+        if backend == LOW_LATENCY:
+            # A decode step carries about one token per running sequence, but
+            # DeepEP LL caps what it will dispatch, and the default cap (511)
+            # is below vLLM's default max_num_seqs (1024).
+            max_num_tokens = min(
+                config.scheduler_config.max_num_seqs, ll_max_tokens_cap()
+            )
+        else:
+            max_num_tokens = getattr(
+                layers[0], "_role_switch_boot_max_num_tokens", None
+            )
 
+    with set_current_vllm_config(config, check_compile=False):
+        # Ask every layer whether it could rebuild, before touching anything.
+        # The weight-layout rules live in the quant methods, so only they can
+        # answer -- and a refusal discovered mid-rebuild would leave the
+        # manager swapped and some layers already switched.
+        _precheck_rebuild(layers, backend)
+        _swap_all2all_manager(backend)
+        # Flip the engine-wide config too, so anything constructed after this
+        # point agrees with the layers that were just rebuilt.
+        config.parallel_config.all2all_backend = backend
+        switched = _rebuild_layers(layers, backend, max_num_tokens)
+
+    logger.info(
+        "role switch: %s -> %s across %d MoE layers, weights untouched",
+        current,
+        backend,
+        switched,
+    )
+    return switched
+
+
+def _precheck_rebuild(layers: list, backend: str) -> None:
+    """Dry-run every layer against ``backend``, restoring config either way.
+
+    The backend has to be flipped for the selection to see it, so it is
+    flipped and put back. Nothing else is touched: dry_run makes the quant
+    method select and check without assigning.
+    """
+    for layer in layers:
+        parallel_config = layer.moe_config.moe_parallel_config
+        saved = parallel_config.all2all_backend
+        try:
+            parallel_config.all2all_backend = backend
+            layer._quant_method.rebuild_moe_kernel(layer, dry_run=True)
+        except RoleSwitchError:
+            raise
+        except Exception as exc:
+            raise RoleSwitchError(
+                f"{type(layer._quant_method).__name__} cannot rebuild for "
+                f"{backend}: {type(exc).__name__}: {exc}"
+            ) from exc
+        finally:
+            parallel_config.all2all_backend = saved
+
+
+def _rebuild_layers(
+    layers: list, backend: str, max_num_tokens: int | None
+) -> int:
     switched = 0
     for layer in layers:
+        moe = layer.moe_config
+        if not hasattr(layer, "_role_switch_boot_max_num_tokens"):
+            layer._role_switch_boot_max_num_tokens = moe.max_num_tokens
+        if max_num_tokens is not None:
+            # Read by maybe_make_prepare_finalize when it sizes the new
+            # handle, so it has to move before the rebuild, not after.
+            moe.max_num_tokens = max_num_tokens
         # One assignment drives the whole derivation: use_deepep_ht_kernels,
         # use_deepep_ll_kernels and use_batched_activation_format are all
         # read-only properties over this field. Mutated in place because the
@@ -268,11 +394,4 @@ def switch_all2all_backend(model: torch.nn.Module, backend: str) -> int:
         layer.moe_config.moe_parallel_config.all2all_backend = backend
         layer._quant_method.rebuild_moe_kernel(layer)
         switched += 1
-
-    logger.info(
-        "role switch: %s -> %s across %d MoE layers, weights untouched",
-        current,
-        backend,
-        switched,
-    )
     return switched

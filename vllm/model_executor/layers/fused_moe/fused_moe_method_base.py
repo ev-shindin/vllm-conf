@@ -38,7 +38,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         # completed migration to the new internal MK interface.
         return self.moe_kernel is not None
 
-    def rebuild_moe_kernel(self, layer) -> None:
+    def rebuild_moe_kernel(self, layer, dry_run: bool = False) -> None:
         """Rebuild this layer's MoE kernel for the current all2all backend.
 
         Called by P/D role switching after ``all2all_backend`` has been flipped
@@ -51,6 +51,11 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         switch to be cheap; re-running the load-time format conversion would
         both cost a full-size allocation and re-process weights that are
         already in kernel format.
+
+        With ``dry_run``, run the selection and every compatibility check but
+        assign nothing. Role switching uses this to refuse an impossible
+        switch before it has mutated anything, and running the real code path
+        beats a second copy of the rules that could drift from it.
         """
         raise NotImplementedError(
             f"{type(self).__name__} does not support rebuilding its MoE kernel "
