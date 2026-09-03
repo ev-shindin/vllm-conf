@@ -15,11 +15,16 @@ decision in the switch, and it can only be made here.
 
 Sequence
 --------
-Pause and drain, lower the budget, switch every worker, resume. Draining is
-belt and braces rather than a correctness requirement: a switch measured under
-41 concurrent requests completed in 748 ms and lost none of 30 in-flight
-completions. It is kept because a quiet engine is a cheaper thing to reason
-about, and because ``pause_scheduler(mode="wait")`` already exists to do it.
+Lower the budget, switch every worker, done. No pause and no drain by
+default: a switch measured under 41 concurrent requests completed in 748 ms
+and lost none of 30 in-flight completions, so there is nothing observed for a
+pause to protect.
+
+Draining via ``pause_scheduler(mode="wait")`` is not merely unnecessary here,
+it is unusable: it drains by continuing to step(), and this runs inside the
+EngineCore busy loop that would have to do the stepping. Waiting on it hung a
+switch for three minutes. ``pause=True`` queues new admissions without
+waiting for anything.
 
 On failure the budget is put back and the scheduler resumed, so a refused
 switch leaves the engine as it was found. The worker-side guards refuse before
@@ -80,26 +85,26 @@ def _set_scheduler_budget(engine_core, budget: int) -> None:
 
 
 def _pause(engine_core) -> str | None:
-    """Quiesce the scheduler, returning the mode used, or None if it could not.
+    """Stop admitting new requests. Never waits, and never drains.
 
-    ``wait`` drains in-flight requests and is what a role change wants.
-    ``keep`` merely stops stepping. Neither is available in every engine
-    configuration -- inproc rejects ``wait`` outright -- and failing to pause is
-    not fatal, because switching under live traffic was measured to be safe.
+    ``pause_scheduler(mode="wait")`` drains by continuing to step(), and
+    this runs inside EngineCore's busy loop -- the only thread that could
+    step. Blocking on its future deadlocks the drain it is waiting for, and
+    that hung a switch for three minutes with no way back.
+
+    So the pause state is set directly and nothing is awaited. New
+    admissions queue for the sub-second the switch takes; requests already
+    running keep running, which is measured to be safe -- 30 of 30 in-flight
+    completions survived a switch under 41 concurrent requests.
     """
-    for mode in ("wait", "keep"):
-        try:
-            future = engine_core.pause_scheduler(mode=mode, clear_cache=False)
-            if future is not None:
-                future.result()
-            return mode
-        except Exception as exc:  # noqa: BLE001 - try the next mode
-            logger.debug("role switch: pause mode %s unavailable: %s", mode, exc)
-    logger.warning(
-        "role switch: could not pause the scheduler; switching with traffic "
-        "still flowing, which is measured to be safe but not preferred"
-    )
-    return None
+    try:
+        from vllm.v1.core.sched.interface import PauseState
+
+        engine_core.scheduler.set_pause_state(PauseState.PAUSED_NEW)
+        return "paused_new"
+    except Exception as exc:  # noqa: BLE001 - not being able to pause is fine
+        logger.debug("role switch: could not pause admissions: %s", exc)
+        return None
 
 
 def switch_pd_role(
@@ -107,15 +112,22 @@ def switch_pd_role(
     backend: str,
     max_num_tokens: int | None = None,
     max_num_batched_tokens: int | None = None,
+    pause: bool = False,
 ) -> dict[str, Any]:
     """Move this engine between prefill and decode roles.
 
     ``max_num_batched_tokens`` is the scheduler budget for the new role and is
     the reason this function exists; ``max_num_tokens`` overrides the MoE
     dispatch bound, which otherwise follows the scheduler budget.
+
+    ``pause`` stops new admissions for the duration. Off by default: it
+    guards against nothing that has been observed, and see _pause for why
+    the draining variant cannot be used from here at all.
     """
     previous_budget = engine_core.scheduler.scheduler_config.max_num_batched_tokens
-    paused_with = _pause(engine_core)
+    # Off by default: it protects against nothing measured, and the one
+    # mode that would have drained is the one that deadlocks here.
+    paused_with = _pause(engine_core) if pause else None
 
     try:
         if max_num_batched_tokens is not None:
