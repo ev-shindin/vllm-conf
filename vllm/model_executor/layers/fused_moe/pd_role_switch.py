@@ -84,6 +84,7 @@ dispatch path is torn down and rebuilt, so a forward pass spanning the switch
 would use half of each backend.
 """
 
+import gc
 import os
 
 import torch
@@ -162,6 +163,60 @@ def _ll_buffer_bytes(moe, num_ranks: int) -> int | None:
         return None
     nvl = envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024
     return int((rdma + nvl) * _SIZING_HINT_UNDERCOUNT)
+
+
+def _live_handles(manager) -> list:
+    """Strong references to the buffers ``manager`` currently owns.
+
+    Must be called BEFORE the layers are rebuilt. handle_cache is a
+    WeakValueDictionary whose only strong referents are the layers'
+    prepare_finalize objects, so after the rebuild there is nothing left
+    to collect and nothing left to destroy.
+    """
+    cache = getattr(manager, "handle_cache", None)
+    inner = getattr(cache, "_cache", None)
+    if inner is None:
+        return []
+    lock = getattr(cache, "_lock", None)
+    if lock is not None:
+        with lock:
+            return list(inner.values())
+    return list(inner.values())
+
+
+def _retire_handles(device_communicator, handles: list, keep: bool) -> None:
+    """Release the old buffers, or hold them so they can be reused.
+
+    Destroying is explicit because deep_ep builds these with
+    explicitly_destroy=True and provides no destructor: a buffer that is
+    merely dropped keeps its GPU memory until the process exits.
+
+    Keeping is also explicit, for the mirror-image reason -- a weakly
+    cached buffer with no strong referent is collected the moment the
+    layers let go, so "cache the manager" alone reuses nothing.
+    """
+    if not handles:
+        return
+    if keep:
+        parked = getattr(device_communicator, "_role_switch_handles", None)
+        if parked is None:
+            parked = []
+            device_communicator._role_switch_handles = parked
+        parked.extend(handles)
+        logger.info("role switch: parked %d handle(s) for reuse", len(handles))
+        return
+    freed = 0
+    for handle in handles:
+        destroy = getattr(handle, "destroy", None)
+        if destroy is None:
+            continue
+        try:
+            destroy()
+            freed += 1
+        except Exception as exc:  # noqa: BLE001 - one bad handle must not
+            # strand the rest; the switch itself has already succeeded.
+            logger.warning("role switch: could not destroy a handle: %s", exc)
+    logger.info("role switch: destroyed %d handle(s)", freed)
 
 
 def _precheck_memory(layers: list, backend: str) -> None:
@@ -445,16 +500,36 @@ def switch_all2all_backend(
         _precheck_rebuild(layers, backend)
         _precheck_memory(layers, backend)
         previous = _swap_all2all_manager(backend, keep_previous)
+        # Captured now, while the layers still hold these alive.
+        old_handles = _live_handles(previous)
         # Flip the engine-wide config too, so anything constructed after this
         # point agrees with the layers that were just rebuilt.
         config.parallel_config.all2all_backend = backend
         switched = _rebuild_layers(layers, backend, max_num_tokens)
-        if not keep_previous and previous is not None:
-            # Only now is nothing holding one of its handles.
-            previous.destroy()
-            logger.info(
-                "role switch: destroyed %s", type(previous).__name__
+        # The layers have let go of the old buffers, so this is the point
+        # at which they can be released -- or deliberately held.
+        #
+        # Deliberately not calling previous.destroy(): it walks the same
+        # handle cache, and the strong references taken above keep those
+        # entries resolvable, so it would destroy each buffer a second
+        # time and deep_ep raises on the repeat. The manager owns nothing
+        # else, so retiring the handles is the whole job.
+        #
+        # Guarded because the switch itself is already done by now. A
+        # buffer that fails to release is worth a warning; it is not worth
+        # reporting a completed role change as failed, which is what an
+        # exception here did.
+        try:
+            _retire_handles(
+                get_ep_group().device_communicator, old_handles, keep_previous
             )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "role switch: switched, but could not retire the old "
+                "buffers (%s); memory may not have been returned", exc
+            )
+        previous = None
+        gc.collect()
 
     logger.info(
         "role switch: %s -> %s across %d MoE layers, weights untouched",
