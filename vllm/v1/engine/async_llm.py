@@ -1066,6 +1066,24 @@ class AsyncLLM(EngineClient):
             set_scaling_elastic_ep(False)
             raise
 
+    async def switch_pd_role(
+        self,
+        backend: str,
+        max_num_tokens: int | None = None,
+        max_num_batched_tokens: int | None = None,
+    ) -> dict:
+        """Move this engine between prefill and decode roles.
+
+        Runs in EngineCore because the scheduler half must: the token
+        budget is cached there at init and cannot be moved from a worker.
+        """
+        return await self.engine_core.call_utility_async(
+            "switch_pd_role",
+            backend,
+            max_num_tokens,
+            max_num_batched_tokens,
+        )
+
     async def scale_elastic_ep(
         self, new_data_parallel_size: int, drain_timeout: int = 300
     ):
