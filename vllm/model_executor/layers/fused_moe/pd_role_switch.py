@@ -137,6 +137,71 @@ def _scheduler_token_budget(config) -> int | None:
     return config.scheduler_config.max_num_batched_tokens
 
 
+# Ratio between what get_low_latency_rdma_size_hint reports and what a live
+# engine was seen to allocate; see the module notes. The worst of two
+# measurements, because underestimating here kills the engine.
+_SIZING_HINT_UNDERCOUNT = 2.6
+
+
+def _ll_buffer_bytes(moe, num_ranks: int) -> int | None:
+    """Bytes the low-latency buffer will want, or None if unknowable here."""
+    try:
+        import deep_ep
+
+        from vllm import envs
+    except ImportError:
+        return None
+    try:
+        rdma = deep_ep.Buffer.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank=moe.max_num_tokens,
+            hidden=moe.hidden_dim,
+            num_ranks=num_ranks,
+            num_experts=moe.num_experts,
+        )
+    except Exception:  # noqa: BLE001 - a hint we cannot get is not fatal
+        return None
+    nvl = envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024
+    return int((rdma + nvl) * _SIZING_HINT_UNDERCOUNT)
+
+
+def _precheck_memory(layers: list, backend: str) -> None:
+    """Refuse if the new buffer plainly will not fit.
+
+    Checked against free memory with the outgoing buffer still resident,
+    which is the real peak: the old manager is only destroyed after every
+    layer has been rebuilt against the new one.
+    """
+    if backend != LOW_LATENCY:
+        return
+    if not torch.cuda.is_available():
+        return
+
+    device_communicator = get_ep_group().device_communicator
+    manager = getattr(device_communicator, "all2all_manager", None)
+    num_ranks = getattr(manager, "world_size", None)
+    if num_ranks is None:
+        return
+
+    needed = _ll_buffer_bytes(layers[0].moe_config, num_ranks)
+    if needed is None:
+        return
+
+    free, _total = torch.cuda.mem_get_info()
+    if needed <= free:
+        return
+    mib = 1024 * 1024
+    raise RoleSwitchError(
+        f"The low-latency buffer needs about {needed // mib} MiB and only "
+        f"{free // mib} MiB is free, so allocating it would take the engine "
+        f"down rather than fail cleanly. It is linear in the token budget "
+        f"(currently {layers[0].moe_config.max_num_tokens}), so lower that, "
+        f"or give the engine more room by lowering "
+        f"gpu_memory_utilization. The estimate carries a margin over "
+        f"deep_ep own sizing hint, which undercounted two live "
+        f"measurements of this same buffer."
+    )
+
+
 class RoleSwitchError(RuntimeError):
     """The engine cannot switch backends. Raised before anything is mutated."""
 
@@ -378,6 +443,7 @@ def switch_all2all_backend(
         # answer -- and a refusal discovered mid-rebuild would leave the
         # manager swapped and some layers already switched.
         _precheck_rebuild(layers, backend)
+        _precheck_memory(layers, backend)
         previous = _swap_all2all_manager(backend, keep_previous)
         # Flip the engine-wide config too, so anything constructed after this
         # point agrees with the layers that were just rebuilt.
