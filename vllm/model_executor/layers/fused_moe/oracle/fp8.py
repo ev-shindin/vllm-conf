@@ -598,6 +598,56 @@ def assert_same_fp8_weight_layout(
     )
 
 
+def rebuild_fp8_moe_kernel(
+    method,
+    layer,
+    weight_key: QuantKey | None,
+    activation_key: QuantKey | None,
+    allow_vllm_cutlass: bool = False,
+    dry_run: bool = False,
+) -> None:
+    """Re-select the experts class and rebuild ``method``'s MoE kernel.
+
+    Shared by every FP8 quantization method, because they differ only in
+    how they derive the two keys. Used by P/D role switching after the
+    all2all backend has changed, which changes the activation format and
+    therefore the experts class.
+
+    Deliberately does NOT call convert_to_fp8_moe_kernel_format: the
+    standard and batched variants of one backend take the same branch
+    there, so the weights already on the device suit either. Re-running it
+    would allocate a second full-size copy of the weights this exists to
+    avoid moving.
+
+    With ``dry_run`` the selection and every compatibility check run but
+    nothing is assigned, so a caller can refuse an impossible switch
+    before it has mutated anything.
+    """
+    backend, experts_cls = select_fp8_moe_backend(
+        config=method.moe,
+        weight_key=weight_key,
+        activation_key=activation_key,
+        allow_vllm_cutlass=allow_vllm_cutlass,
+    )
+    if backend != method.fp8_backend:
+        assert_same_fp8_weight_layout(method.fp8_backend, backend)
+
+    if dry_run:
+        return
+
+    method.fp8_backend = backend
+    method.experts_cls = experts_cls
+    assert method.moe_quant_config is not None
+    assert method.experts_cls is not None
+    method.moe_kernel = make_fp8_moe_kernel(
+        moe_quant_config=method.moe_quant_config,
+        moe_config=method.moe,
+        fp8_backend=method.fp8_backend,
+        experts_cls=method.experts_cls,
+        routing_tables=layer._expert_routing_tables(),
+    )
+
+
 def make_fp8_moe_quant_config(
     fp8_backend: Fp8MoeBackend,
     w1_scale: torch.Tensor,

@@ -138,10 +138,18 @@ def _scheduler_token_budget(config) -> int | None:
     return config.scheduler_config.max_num_batched_tokens
 
 
-# Ratio between what get_low_latency_rdma_size_hint reports and what a live
-# engine was seen to allocate; see the module notes. The worst of two
-# measurements, because underestimating here kills the engine.
-_SIZING_HINT_UNDERCOUNT = 2.6
+# get_low_latency_rdma_size_hint undercounts what a live engine allocates by
+# a roughly fixed amount, not a fixed ratio. Measured twice on hints that
+# differ by 2x: 1544 -> 4264 (excess 2720) and 3104 -> 5838 (excess 2734).
+# The likely source is the batched-experts workspace, which does not scale
+# with the communication buffer.
+#
+# Treating it as a multiplier overestimates badly at large buffers and would
+# refuse configurations that fit. Both measurements come from one model
+# shape, so a safety factor is applied on top rather than trusting the
+# constant precisely.
+_SIZING_FIXED_OVERHEAD_MIB = 2734
+_SIZING_SAFETY = 1.15
 
 
 def _ll_buffer_bytes(moe, num_ranks: int) -> int | None:
@@ -162,7 +170,8 @@ def _ll_buffer_bytes(moe, num_ranks: int) -> int | None:
     except Exception:  # noqa: BLE001 - a hint we cannot get is not fatal
         return None
     nvl = envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024
-    return int((rdma + nvl) * _SIZING_HINT_UNDERCOUNT)
+    overhead = _SIZING_FIXED_OVERHEAD_MIB * 1024 * 1024
+    return int((rdma + nvl + overhead) * _SIZING_SAFETY)
 
 
 def _live_handles(manager) -> list:
@@ -251,9 +260,9 @@ def _precheck_memory(layers: list, backend: str) -> None:
         f"down rather than fail cleanly. It is linear in the token budget "
         f"(currently {layers[0].moe_config.max_num_tokens}), so lower that, "
         f"or give the engine more room by lowering "
-        f"gpu_memory_utilization. The estimate carries a margin over "
-        f"deep_ep own sizing hint, which undercounted two live "
-        f"measurements of this same buffer."
+        f"gpu_memory_utilization. The estimate adds a fixed overhead "
+        f"measured alongside deep_ep own sizing hint, which undercounts "
+        f"what a live engine allocates."
     )
 
 

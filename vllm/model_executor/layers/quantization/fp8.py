@@ -28,10 +28,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
-    assert_same_fp8_weight_layout,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
+    rebuild_fp8_moe_kernel,
     select_fp8_moe_backend,
 )
 from vllm.model_executor.layers.linear import (
@@ -693,41 +693,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def rebuild_moe_kernel(
         self, layer: RoutedExperts, dry_run: bool = False
     ) -> None:
-        """Re-select the experts class and rebuild the kernel around it.
-
-        Deliberately does NOT call ``convert_to_fp8_moe_kernel_format``: the
-        standard and batched variants of one FP8 backend take the same branch
-        there (``DEEPGEMM``/``BATCHED_DEEPGEMM`` share
-        ``prepare_fp8_moe_layer_for_deepgemm``; the TRITON and VLLM_CUTLASS
-        pairs share doing nothing), so the weights already on the device are
-        correct for both. Re-running it would allocate a second full-size copy
-        of weights this switch exists to avoid moving.
-        """
-        backend, experts_cls = select_fp8_moe_backend(
-            config=self.moe,
+        rebuild_fp8_moe_kernel(
+            self,
+            layer,
             weight_key=self.weight_key,
             activation_key=self.activation_key,
             allow_vllm_cutlass=False,
-        )
-        if backend != self.fp8_backend:
-            # Expected: the batched variant of the same backend. A jump to an
-            # unrelated backend would imply a different weight layout, and the
-            # weights are not being reconverted.
-            assert_same_fp8_weight_layout(self.fp8_backend, backend)
-
-        if dry_run:
-            return
-
-        self.fp8_backend = backend
-        self.experts_cls = experts_cls
-        assert self.moe_quant_config is not None
-        assert self.experts_cls is not None
-        self.moe_kernel = make_fp8_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            fp8_backend=self.fp8_backend,
-            experts_cls=self.experts_cls,
-            routing_tables=layer._expert_routing_tables(),
+            dry_run=dry_run,
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
