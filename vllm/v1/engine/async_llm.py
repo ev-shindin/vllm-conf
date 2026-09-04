@@ -1082,12 +1082,39 @@ class AsyncLLM(EngineClient):
         through one data-parallel rank changes that rank alone on a single node
         and deadlocks across nodes.
         """
-        results = await self.engine_core.call_utility_all_async(
-            "switch_pd_role",
-            backend,
-            max_num_tokens,
-            max_num_batched_tokens,
+        # Quiesce every core BEFORE the collective, then switch, then resume.
+        #
+        # Fanning the switch out is not sufficient on its own. The rebuild is a
+        # collective -- no rank returns until all have entered -- but the calls
+        # are delivered as independent per-engine messages, and under
+        # data parallelism the cores advance in lockstep through the DP
+        # coordinator. So the first core to dequeue can enter the barrier and
+        # block, which stalls the coordinator, which stops the remaining cores
+        # from ever dequeuing their own message. Rank 0 then waits forever for
+        # ranks that are waiting on rank 0.
+        #
+        # That is a race, not a constant failure: when all cores happen to
+        # dequeue inside the same coordinator gap the switch completes in
+        # ~440ms, and when one gets there first it hangs. Both were observed
+        # for the SAME call on a 2x8 run.
+        #
+        # "keep" sets PAUSED_ALL and skips step(), so a paused core sits
+        # polling its input queue and no core is waiting on any other. It
+        # returns None synchronously while the engine is idle.
+        await self.engine_core.call_utility_all_async(
+            "pause_scheduler", "keep", False
         )
+        try:
+            results = await self.engine_core.call_utility_all_async(
+                "switch_pd_role",
+                backend,
+                max_num_tokens,
+                max_num_batched_tokens,
+            )
+        finally:
+            # Resume even if the switch failed, or a refusal would leave the
+            # whole job parked and serving nothing.
+            await self.engine_core.call_utility_all_async("resume_scheduler")
         if len(results) == 1:
             return results[0]
         # layers_switched is per rank and identical across them, so report it
