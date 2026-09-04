@@ -1076,13 +1076,32 @@ class AsyncLLM(EngineClient):
 
         Runs in EngineCore because the scheduler half must: the token
         budget is cached there at init and cannot be moved from a worker.
+
+        Fanned out to every EngineCore, not just ``core_engine``. The DeepEP
+        buffer rebuild is collective over the EP group, so a switch driven
+        through one data-parallel rank changes that rank alone on a single node
+        and deadlocks across nodes.
         """
-        return await self.engine_core.call_utility_async(
+        results = await self.engine_core.call_utility_all_async(
             "switch_pd_role",
             backend,
             max_num_tokens,
             max_num_batched_tokens,
         )
+        if len(results) == 1:
+            return results[0]
+        # layers_switched is per rank and identical across them, so report it
+        # as-is rather than summed; ranks_switched is what says whether the
+        # whole job moved or only part of it did.
+        return {
+            "backend": backend,
+            "ranks_switched": sum(1 for r in results if r.get("layers_switched")),
+            "ranks_total": len(results),
+            "layers_switched": max(
+                (r.get("layers_switched", 0) for r in results), default=0
+            ),
+            "per_rank": results,
+        }
 
     async def scale_elastic_ep(
         self, new_data_parallel_size: int, drain_timeout: int = 300

@@ -1143,6 +1143,30 @@ class AsyncMPClient(MPClient):
         self._ensure_output_queue_task()
         return await future
 
+    async def call_utility_all_async(self, method: str, *args) -> list[Any]:
+        """Run a utility method on EVERY EngineCore this client manages.
+
+        ``call_utility_async`` targets ``self.core_engine``, which is
+        ``core_engines[0]`` -- a single data-parallel rank. That is correct for
+        a query, but wrong for anything collective: rebuilding a DeepEP buffer
+        has to be entered by every rank of the EP group at once. Driven through
+        rank 0 alone it switches only that rank intranode, and internode it
+        deadlocks, because the rebuild takes an NVSHMEM barrier across nodes
+        that the other ranks never reach.
+
+        The calls are issued concurrently and awaited together: each one blocks
+        inside the collective until the rest have joined, so sending them in
+        sequence would hang on the first.
+
+        In pure internal-LB mode ``core_engines`` spans the remote ranks too, so
+        one call covers the whole job. Under external LB it covers this client's
+        local engines only, and every API server has to be called.
+        """
+        engines = getattr(self, "core_engines", None) or [self.core_engine]
+        return await asyncio.gather(
+            *(self._call_utility_async(method, *args, engine=e) for e in engines)
+        )
+
     async def get_supported_tasks_async(self) -> tuple[SupportedTask, ...]:
         return await self.call_utility_async("get_supported_tasks")
 
