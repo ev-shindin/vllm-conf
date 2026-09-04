@@ -152,17 +152,28 @@ _SIZING_FIXED_OVERHEAD_MIB = 2734
 _SIZING_SAFETY = 1.15
 
 
-def _ll_buffer_bytes(moe, num_ranks: int) -> int | None:
-    """Bytes the low-latency buffer will want, or None if unknowable here."""
+def _ll_buffer_bytes(
+    moe, num_ranks: int, max_num_tokens: int | None = None
+) -> int | None:
+    """Bytes the low-latency buffer will want, or None if unknowable here.
+
+    ``max_num_tokens`` is the budget the buffer will actually be built with.
+    It must be passed when sizing a switch that is about to change it: the
+    layers still carry the OUTGOING role's budget at precheck time, and the
+    buffer is linear in it, so sizing from ``moe`` alone measures the wrong
+    role and refuses switches that fit.
+    """
     try:
         import deep_ep
 
         from vllm import envs
     except ImportError:
         return None
+    if max_num_tokens is None:
+        max_num_tokens = moe.max_num_tokens
     try:
         rdma = deep_ep.Buffer.get_low_latency_rdma_size_hint(
-            num_max_dispatch_tokens_per_rank=moe.max_num_tokens,
+            num_max_dispatch_tokens_per_rank=max_num_tokens,
             hidden=moe.hidden_dim,
             num_ranks=num_ranks,
             num_experts=moe.num_experts,
@@ -228,12 +239,19 @@ def _retire_handles(device_communicator, handles: list, keep: bool) -> None:
     logger.info("role switch: destroyed %d handle(s)", freed)
 
 
-def _precheck_memory(layers: list, backend: str) -> None:
+def _precheck_memory(
+    layers: list, backend: str, max_num_tokens: int | None = None
+) -> None:
     """Refuse if the new buffer plainly will not fit.
 
     Checked against free memory with the outgoing buffer still resident,
     which is the real peak: the old manager is only destroyed after every
     layer has been rebuilt against the new one.
+
+    ``max_num_tokens`` is the INCOMING role's budget. The layers are not
+    rebuilt until after this runs, so ``moe_config.max_num_tokens`` is still
+    the outgoing role's value; sizing from it charged a 508-token low-latency
+    switch for a 2048-token buffer and refused a switch that fits.
     """
     if backend != LOW_LATENCY:
         return
@@ -246,19 +264,24 @@ def _precheck_memory(layers: list, backend: str) -> None:
     if num_ranks is None:
         return
 
-    needed = _ll_buffer_bytes(layers[0].moe_config, num_ranks)
+    needed = _ll_buffer_bytes(layers[0].moe_config, num_ranks, max_num_tokens)
     if needed is None:
         return
 
     free, _total = torch.cuda.mem_get_info()
     if needed <= free:
         return
+    sized_for = (
+        max_num_tokens
+        if max_num_tokens is not None
+        else layers[0].moe_config.max_num_tokens
+    )
     mib = 1024 * 1024
     raise RoleSwitchError(
         f"The low-latency buffer needs about {needed // mib} MiB and only "
         f"{free // mib} MiB is free, so allocating it would take the engine "
         f"down rather than fail cleanly. It is linear in the token budget "
-        f"(currently {layers[0].moe_config.max_num_tokens}), so lower that, "
+        f"(sized for {sized_for}), so lower that, "
         f"or give the engine more room by lowering "
         f"gpu_memory_utilization. The estimate adds a fixed overhead "
         f"measured alongside deep_ep own sizing hint, which undercounts "
@@ -507,7 +530,9 @@ def switch_all2all_backend(
         # answer -- and a refusal discovered mid-rebuild would leave the
         # manager swapped and some layers already switched.
         _precheck_rebuild(layers, backend)
-        _precheck_memory(layers, backend)
+        # max_num_tokens is fully resolved above; pass it so the buffer is
+        # sized for the role being switched TO, not the one being left.
+        _precheck_memory(layers, backend, max_num_tokens)
         previous = _swap_all2all_manager(backend, keep_previous)
         # Captured now, while the layers still hold these alive.
         old_handles = _live_handles(previous)
