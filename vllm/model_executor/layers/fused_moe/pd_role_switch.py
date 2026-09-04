@@ -259,6 +259,24 @@ def _precheck_memory(
         return
 
     device_communicator = get_ep_group().device_communicator
+
+    # A buffer parked by an earlier keep_previous switch is REUSED, not rebuilt:
+    # the park holds a strong reference, so the manager's weak handle_cache
+    # still resolves and get_or_create returns it. Nothing is allocated, so the
+    # free-memory test does not apply -- and applying it anyway refused a switch
+    # back to a buffer already resident, by 101 MiB, on a run where the engine
+    # had all the memory it needed.
+    #
+    # Mode is the only thing checked because the park is only reused when the
+    # manager's own kwargs match, token budget included; a differing budget
+    # misses the cache and builds a new buffer, which this precheck then sizes
+    # correctly on the next call.
+    for handle in getattr(device_communicator, "_role_switch_handles", None) or []:
+        if bool(getattr(handle, "low_latency_mode", False)) == (
+            backend == LOW_LATENCY
+        ):
+            return
+
     manager = getattr(device_communicator, "all2all_manager", None)
     num_ranks = getattr(manager, "world_size", None)
     if num_ranks is None:
@@ -368,6 +386,7 @@ def check_switchable(
     backend: str,
     max_num_tokens: int | None = None,
     config=None,
+    keep_previous: bool = False,
 ) -> list[torch.nn.Module]:
     """Validate the switch and return the layers it would touch.
 
@@ -375,7 +394,10 @@ def check_switchable(
     a restart, so every reason to refuse is collected here rather than
     discovered layer by layer.
     """
-    _refuse_if_cudagraphs(config)
+    # Only a switch that FREES the outgoing buffer can strand a captured graph,
+    # so the refusal does not apply when the buffer is retained.
+    if not keep_previous:
+        _refuse_if_cudagraphs(config)
     if backend == LOW_LATENCY and max_num_tokens is not None:
         cap = ll_max_tokens_cap()
         scheduled = _scheduler_token_budget(config)
@@ -541,7 +563,21 @@ def switch_all2all_backend(
             "rebuild reads it, and a worker RPC has no ambient config."
         )
 
-    layers = check_switchable(model, backend, max_num_tokens, config)
+    # Keeping the outgoing buffer alive is what makes CUDA graphs survivable:
+    # they break because the switch FREES the memory they baked addresses into,
+    # so if nothing is freed there is no use-after-free. Costs both buffers
+    # resident (measured 4.28 GiB for low latency, ~1 GiB for high throughput,
+    # against 10.1 GiB free at EP=8).
+    #
+    # Env-gated because it is an experiment, not a settled default: vLLM keys
+    # its graph cache by BatchDescriptor, i.e. by SHAPE and not by backend, so a
+    # decode-shaped batch after a switch may replay a graph captured for the
+    # other backend -- right addresses, wrong kernels. That is what the run
+    # this flag enables is meant to find out.
+    if not keep_previous:
+        keep_previous = os.environ.get("VLLM_PD_KEEP_PREVIOUS", "0") == "1"
+
+    layers = check_switchable(model, backend, max_num_tokens, config, keep_previous)
     current = layers[0].moe_config.moe_parallel_config.all2all_backend
     if current == backend:
         logger.info("role switch: already on %s, nothing to do", backend)
