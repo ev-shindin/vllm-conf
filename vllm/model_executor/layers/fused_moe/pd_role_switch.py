@@ -524,6 +524,18 @@ def switch_all2all_backend(
                 layers[0], "_role_switch_boot_max_num_tokens", None
             )
 
+    # Logged before the collective, not after, so a switch that hangs still
+    # says which ranks entered it. The completion log alone cannot: rebuilding
+    # the buffer takes a barrier over the whole EP group, so if any rank is
+    # missing every other rank blocks and nothing is ever logged.
+    logger.info(
+        "role switch: ENTER %s -> %s, %d layers, max_num_tokens=%s",
+        current,
+        backend,
+        len(layers),
+        max_num_tokens,
+    )
+
     with set_current_vllm_config(config, check_compile=False):
         # Ask every layer whether it could rebuild, before touching anything.
         # The weight-layout rules live in the quant methods, so only they can
