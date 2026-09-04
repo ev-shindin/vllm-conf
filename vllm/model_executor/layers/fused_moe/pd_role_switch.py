@@ -327,6 +327,42 @@ def _moe_layers(model: torch.nn.Module) -> list[torch.nn.Module]:
     return layers
 
 
+def _refuse_if_cudagraphs(config) -> None:
+    """Refuse the switch when CUDA graphs are captured.
+
+    A captured graph bakes in the addresses inside the DeepEP buffer, and the
+    switch frees that buffer. Nothing fails at the switch itself: the engine
+    dies on the NEXT forward pass with an illegal memory access raised from
+    torch/cuda/graphs.py replay(), which points nowhere near the cause.
+
+    Dropping the graphs instead does not help. vLLM only permits capture inside
+    its own graph_capture() context, so serving then raises "CUDA graph
+    capturing detected at an inappropriate time"; and re-capturing from the
+    worker during the switch fails too, because DeepEP leaves CPU-side and
+    side-stream work that cannot be stream-captured -- measured as
+    cudaErrorStreamCaptureUnjoined after ~130s, then a DeepEP CPU recv timeout.
+
+    So this is a genuine precondition, not a missing feature: a switchable
+    engine must run with enforce_eager. Refusing here converts a dead engine
+    into an actionable error.
+    """
+    compilation_config = getattr(config, "compilation_config", None)
+    if compilation_config is None:
+        return
+    if getattr(compilation_config, "enforce_eager", False):
+        return
+    mode = getattr(compilation_config, "cudagraph_mode", None)
+    if mode is None or str(mode).endswith("NONE"):
+        return
+    raise RoleSwitchError(
+        f"Cannot switch roles while CUDA graphs are in use (cudagraph_mode="
+        f"{mode}). Captured graphs hold addresses inside the DeepEP buffer "
+        f"this switch frees, and the engine would die on its next forward "
+        f"pass with an illegal memory access. Start the engine with "
+        f"--enforce-eager to make it switchable."
+    )
+
+
 def check_switchable(
     model: torch.nn.Module,
     backend: str,
@@ -339,6 +375,7 @@ def check_switchable(
     a restart, so every reason to refuse is collected here rather than
     discovered layer by layer.
     """
+    _refuse_if_cudagraphs(config)
     if backend == LOW_LATENCY and max_num_tokens is not None:
         cap = ll_max_tokens_cap()
         scheduled = _scheduler_token_budget(config)
