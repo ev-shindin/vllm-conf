@@ -107,6 +107,61 @@ def _pause(engine_core) -> str | None:
         return None
 
 
+# Connectors that cache the role at __init__ instead of reading it from the
+# config on each use. Flipping the config under those desynchronises them:
+# MooncakeConnector sets self.is_kv_producer once in its constructor, so it
+# would keep behaving as whatever it was built as while the config claims
+# otherwise. Refuse rather than half-switch.
+_ROLE_CACHING_CONNECTORS = frozenset({"MooncakeConnector", "MooncakeStoreConnector"})
+
+# Literals rather than importing HIGH_THROUGHPUT/LOW_LATENCY from
+# pd_role_switch: this module imports that one lazily, inside the function,
+# and a module-level import would risk a cycle for two string constants.
+_BACKEND_KV_ROLE = {
+    "deepep_high_throughput": "kv_producer",
+    "deepep_low_latency": "kv_consumer",
+}
+
+
+def _switch_kv_role(engine_core, backend: str) -> str | None:
+    """Point the KV connector the way the new role sends KV. Returns the
+    role now in effect, or None when there is no connector to point.
+
+    Prefill produces KV and decode consumes it, so a role change is also a
+    direction change. kv_role='kv_both' still works but is deprecated with
+    NixlConnector and slated for removal.
+
+    Safe as a plain assignment for NIXL: across base_worker, pull_worker,
+    push_worker and both schedulers, kv_role is read exactly once -- a
+    pp_size > 1 guard -- and every other reference sits behind a pcp_size >
+    1 check. Memory registration, handshake and transfers are all
+    role-agnostic, which is precisely why kv_both works at all. So on this
+    path the flip is a declaration of intent rather than a behaviour
+    change, and nothing has to be torn down.
+    """
+    cfg = getattr(engine_core.vllm_config, "kv_transfer_config", None)
+    if cfg is None or getattr(cfg, "kv_connector", None) is None:
+        return None
+    wanted = _BACKEND_KV_ROLE.get(backend)
+    if wanted is None or cfg.kv_role == wanted:
+        return getattr(cfg, "kv_role", None)
+    if cfg.kv_connector in _ROLE_CACHING_CONNECTORS:
+        raise RuntimeError(
+            f"{cfg.kv_connector} caches kv_role at construction, so moving"
+            f" it from {cfg.kv_role} to {wanted} here would leave the"
+            f" connector and the config disagreeing. Run this engine with a"
+            f" connector that reads kv_role per call, or pin the role."
+        )
+    logger.info(
+        "role switch: kv_role %s -> %s for %s",
+        cfg.kv_role,
+        wanted,
+        cfg.kv_connector,
+    )
+    cfg.kv_role = wanted
+    return wanted
+
+
 def switch_pd_role(
     engine_core,
     backend: str,
@@ -129,9 +184,15 @@ def switch_pd_role(
     # mode that would have drained is the one that deadlocks here.
     paused_with = _pause(engine_core) if pause else None
 
+    previous_kv_role = getattr(
+        getattr(engine_core.vllm_config, "kv_transfer_config", None),
+        "kv_role",
+        None,
+    )
     try:
         if max_num_batched_tokens is not None:
             _set_scheduler_budget(engine_core, max_num_batched_tokens)
+        kv_role = _switch_kv_role(engine_core, backend)
         switched = engine_core.model_executor.collective_rpc(
             _worker_switch_role,
             args=(backend, max_num_tokens, max_num_batched_tokens),
@@ -142,6 +203,10 @@ def switch_pd_role(
         # left exactly as it was found.
         if max_num_batched_tokens is not None:
             _set_scheduler_budget(engine_core, previous_budget)
+        # The direction is part of the role, so it goes back with it.
+        cfg = getattr(engine_core.vllm_config, "kv_transfer_config", None)
+        if cfg is not None and previous_kv_role is not None:
+            cfg.kv_role = previous_kv_role
         raise
     finally:
         if paused_with is not None:
@@ -164,4 +229,9 @@ def switch_pd_role(
         ),
         "previous_scheduler_budget": previous_budget,
         "paused_with": paused_with,
+        # Reported so the caller can see the direction as well as the
+        # backend: prefill produces KV, decode consumes it, and a control
+        # plane labelling Pods by role needs both halves to agree.
+        "kv_role": kv_role,
+        "previous_kv_role": previous_kv_role,
     }
