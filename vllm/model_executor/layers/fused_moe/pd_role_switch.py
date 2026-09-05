@@ -204,6 +204,28 @@ def _live_handles(manager) -> list:
     return list(inner.values())
 
 
+def _is_internode() -> bool:
+    """True when the expert-parallel group spans more than one NVLink domain.
+
+    deep_ep only touches NVSHMEM above ``NUM_MAX_NVL_PEERS``; at or below it a
+    buffer is plain CUDA IPC. That threshold is what separates the two switch
+    orderings, so it is read from deep_ep rather than hardcoded.
+    """
+    try:
+        manager = getattr(get_ep_group().device_communicator, "all2all_manager", None)
+        world_size = getattr(manager, "world_size", None)
+        if world_size is None:
+            return False
+        import deep_ep
+
+        max_nvl = getattr(deep_ep, "LEGACY_NUM_MAX_NVL_PEERS", None) or getattr(
+            deep_ep, "NUM_MAX_NVL_PEERS", 8
+        )
+        return world_size > int(max_nvl)
+    except Exception:  # noqa: BLE001 - unknown topology: keep the safe ordering
+        return False
+
+
 def _retire_handles(device_communicator, handles: list, keep: bool) -> None:
     """Release the old buffers, or hold them so they can be reused.
 
@@ -624,6 +646,36 @@ def switch_all2all_backend(
         # Flip the engine-wide config too, so anything constructed after this
         # point agrees with the layers that were just rebuilt.
         config.parallel_config.all2all_backend = backend
+
+        # Internode ONLY: release the old buffer before building the new one.
+        #
+        # deep_ep initialises NVSHMEM per internode buffer, and the two modes
+        # ask for different worlds -- low latency takes (global rank, num_ranks,
+        # stride NUM_MAX_NVL_PEERS), high throughput takes (rdma_rank,
+        # num_rdma_ranks, stride 0). Building the new buffer while the old one
+        # still holds NVSHMEM therefore re-inits over a live world and trips
+        # either "cpu_rdma_team != NVSHMEM_TEAM_INVALID" or the
+        # "nvshmem_rank == nvshmem::init(...)" assert in legacy/buffer.hpp.
+        #
+        # Buffer::destroy() calls nvshmem::finalize() when num_rdma_bytes > 0,
+        # so retiring first hands the new buffer an uninitialised NVSHMEM. The
+        # engine is paused here, so the window with no buffer is not observable.
+        #
+        # Intranode keeps the original order: no NVSHMEM is involved below
+        # NUM_MAX_NVL_PEERS, both buffers coexist, and destroying early would
+        # give up the retain-and-reuse path that makes CUDA graphs work.
+        internode = _is_internode()
+        if internode and not keep_previous and old_handles:
+            logger.info(
+                "role switch: internode -- releasing %d old buffer(s) before "
+                "building the new one, so NVSHMEM is finalized first",
+                len(old_handles),
+            )
+            _retire_handles(
+                get_ep_group().device_communicator, old_handles, False
+            )
+            old_handles = []
+
         switched = _rebuild_layers(layers, backend, max_num_tokens)
         # The layers have let go of the old buffers, so this is the point
         # at which they can be released -- or deliberately held.
