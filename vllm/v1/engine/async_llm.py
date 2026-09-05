@@ -1098,11 +1098,30 @@ class AsyncLLM(EngineClient):
         # ~440ms, and when one gets there first it hangs. Both were observed
         # for the SAME call on a 2x8 run.
         #
-        # "keep" sets PAUSED_ALL and skips step(), so a paused core sits
-        # polling its input queue and no core is waiting on any other. It
-        # returns None synchronously while the engine is idle.
+        # DRAIN in-flight work before switching, rather than freezing it.
+        #
+        # "wait" sets PAUSED_NEW: new admissions are queued but the core KEEPS
+        # STEPPING, so requests already generating run to completion, and the
+        # returned Future completes once the engine is idle. "keep" sets
+        # PAUSED_ALL instead, which skips step() -- pending outputs flush but
+        # half-generated requests are frozen across the rebuild and resumed
+        # afterwards. Draining is the conservative choice: nothing is mid-flight
+        # while the DeepEP buffer is destroyed and rebuilt.
+        #
+        # This does not deadlock the way pause_scheduler(mode="wait") did when
+        # called from inside EngineCore: the utility RPC defers its reply via
+        # Future.add_done_callback (see EngineCoreProc._invoke_utility_method),
+        # so the engine loop keeps running and draining while the caller waits.
+        #
+        # The cost is switch latency bounded by the longest in-flight
+        # generation. Set VLLM_PD_PAUSE_MODE=keep for the old freeze-and-resume
+        # behaviour when that latency matters more than the guarantee.
+        #
+        # clear_cache stays False either way -- the prefix cache is unaffected
+        # by the switch and discarding it would be a needless cold start.
+        pause_mode = os.environ.get("VLLM_PD_PAUSE_MODE", "wait")
         await self.engine_core.call_utility_all_async(
-            "pause_scheduler", "keep", False
+            "pause_scheduler", pause_mode, False
         )
         try:
             results = await self.engine_core.call_utility_all_async(
