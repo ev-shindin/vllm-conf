@@ -386,6 +386,19 @@ def _refuse_if_cudagraphs(config) -> None:
     engine must run with enforce_eager. Refusing here converts a dead engine
     into an actionable error.
     """
+    # Escape hatch for evaluating whether a given cudagraph_mode is actually
+    # unsafe. The refusal is deliberately broad -- anything that is not NONE --
+    # which also blocks the experiments that would narrow it; PIECEWISE may well
+    # leave the DeepEP dispatch outside the captured region, but the guard
+    # refuses before that can be observed. Off by default.
+    if os.environ.get("VLLM_PD_ALLOW_CUDAGRAPHS", "0") == "1":
+        logger.warning(
+            "role switch: proceeding with CUDA graphs enabled because "
+            "VLLM_PD_ALLOW_CUDAGRAPHS=1. If any captured graph touches the "
+            "DeepEP buffer, the engine will die on its next forward pass."
+        )
+        return
+
     compilation_config = getattr(config, "compilation_config", None)
     if compilation_config is None:
         return
