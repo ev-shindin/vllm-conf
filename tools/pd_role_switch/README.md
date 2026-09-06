@@ -119,6 +119,30 @@ Set `VLLM_PD_KEEP_PREVIOUS=1` (the script does) to park the outgoing buffer.
 That is what keeps captured CUDA graphs valid and makes the return switch cost
 378 ms and 0 MiB instead of a full rebuild.
 
+## KV connector direction
+
+A role change is also a KV direction change: prefill produces KV, decode
+consumes it. When a KV connector is configured, the switch moves
+`kv_transfer_config.kv_role` with the role -- `kv_producer` when the budget
+grows, `kv_consumer` when it shrinks -- so `kv_both`, which is deprecated for
+NixlConnector, is not required.
+
+The response reports it:
+
+```json
+{"backend":"deepep_v2","ranks_switched":16,"kv_role":"kv_consumer",
+ "previous_kv_role":"kv_producer"}
+```
+
+Connectors that read `kv_role` once at construction (`MooncakeConnector`,
+`MooncakeStoreConnector`) are refused rather than left disagreeing with the
+config. NIXL reads it per call, so the flip is a declaration of intent and
+nothing is torn down.
+
+**Not yet verified on hardware.** Every measurement in this document ran with no
+KV connector attached, so the direction flip is implemented and reviewed but
+unexercised. Treat it as untested until a run with a connector confirms it.
+
 ## Requirements
 
 - 8 GPUs per node; InfiniBand with GIN (GPU-Initiated Networking) for multi-node

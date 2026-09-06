@@ -122,8 +122,31 @@ _BACKEND_KV_ROLE = {
     "deepep_low_latency": "kv_consumer",
 }
 
+# One backend serves both roles under deepep_v2, so its name says nothing
+# about direction and the map above cannot answer for it.
+_BUDGET_KEYED_BACKENDS = frozenset({"deepep_v2"})
 
-def _switch_kv_role(engine_core, backend: str) -> str | None:
+
+def _kv_role_for_budget(previous: int | None, current: int | None) -> str | None:
+    """KV direction implied by a change in the scheduler budget.
+
+    Prefill runs a large budget and produces KV; decode runs a small one and
+    consumes it. So a budget that shrank means the engine moved to decode and
+    one that grew means it moved to prefill. An unchanged budget is not a role
+    change and must not move the connector.
+    """
+    if previous is None or current is None or previous == current:
+        return None
+    return "kv_consumer" if current < previous else "kv_producer"
+
+
+
+def _switch_kv_role(
+    engine_core,
+    backend: str,
+    previous_budget: int | None = None,
+    current_budget: int | None = None,
+) -> str | None:
     """Point the KV connector the way the new role sends KV. Returns the
     role now in effect, or None when there is no connector to point.
 
@@ -142,7 +165,10 @@ def _switch_kv_role(engine_core, backend: str) -> str | None:
     cfg = getattr(engine_core.vllm_config, "kv_transfer_config", None)
     if cfg is None or getattr(cfg, "kv_connector", None) is None:
         return None
-    wanted = _BACKEND_KV_ROLE.get(backend)
+    if backend in _BUDGET_KEYED_BACKENDS:
+        wanted = _kv_role_for_budget(previous_budget, current_budget)
+    else:
+        wanted = _BACKEND_KV_ROLE.get(backend)
     if wanted is None or cfg.kv_role == wanted:
         return getattr(cfg, "kv_role", None)
     if cfg.kv_connector in _ROLE_CACHING_CONNECTORS:
@@ -192,7 +218,12 @@ def switch_pd_role(
     try:
         if max_num_batched_tokens is not None:
             _set_scheduler_budget(engine_core, max_num_batched_tokens)
-        kv_role = _switch_kv_role(engine_core, backend)
+        kv_role = _switch_kv_role(
+            engine_core,
+            backend,
+            previous_budget=previous_budget,
+            current_budget=max_num_batched_tokens,
+        )
         switched = engine_core.model_executor.collective_rpc(
             _worker_switch_role,
             args=(backend, max_num_tokens, max_num_batched_tokens),
