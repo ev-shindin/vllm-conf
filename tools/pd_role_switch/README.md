@@ -170,11 +170,14 @@ unexercised. Treat it as untested until a run with a connector confirms it.
 
 ## Scope of these numbers
 
-Measured at EP=16 on H200. Not yet measured
-against an eager baseline (CUDA graphs are captured and in-flight requests
-survive a switch, but tokens/s has not been compared), and how the buffer scales
-with EP *width* — every number here is EP=16, and a DeepEP buffer holds receive
-space related to rank count, so EP=32 is a projection rather than a measurement.
+Measured at EP=16 on H200. Not yet measured: how the buffer scales with EP
+*width*. Every number here is EP=16, and a DeepEP buffer holds receive space
+related to rank count, so EP=32 is a projection rather than a measurement.
+
+The switch latencies were taken on kermit with node-local weights; the
+throughput pair was taken on fozzie, where weights come off a shared PVC. Both
+halves of that pair ran in identical conditions, so the 4.38x ratio stands, but
+absolute switch timings differ between the two clusters.
 
 Rows marked "projected" are derived from the two measured budget points, not
 observed directly.
