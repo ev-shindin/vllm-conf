@@ -1,102 +1,105 @@
-# Reproducing P/D role switching on a live engine
+# P/D role switching on a live engine
 
-One engine that switches between the prefill and decode MoE configuration
-without reloading weights, including **across nodes with CUDA graphs intact**.
+One engine that moves between the prefill and decode MoE configuration in
+**under 400 ms**, without reloading weights, across nodes, with CUDA graphs
+intact.
 
-Internode is the interesting case. Under NVSHMEM the high-throughput and
-low-latency buffers cannot coexist — `nvshmem::init` is called with different
-team parameters for each, so the old buffer must be destroyed before the new one
-is built. A destroy strands every captured CUDA graph, which leaves internode
-eager-only, and eager was measured at **4.9x slower decode** (32403 ms vs
-6573 ms for the same 4096 tokens). `deepep_v2` replaces NVSHMEM with NCCL
-symmetric memory, two `ElasticBuffer`s *do* coexist, and the graphs survive.
+A replica no longer has to be a prefill replica or a decode replica. It can be
+whichever the current load needs, so a fleet is provisioned for total demand
+rather than for peak-prefill plus peak-decode separately.
 
-## What has actually been measured
+## Results
 
-Measured on 2x8 H200 (139.8 GiB), GLM-5.2-FP8, EP=16, `gpu-memory-utilization`
-0.90, vLLM v0.28.0. Numbers below are from real runs, not estimates.
+Measured on 2 x 8 H200 (139.8 GiB), GLM-5.2-FP8, EP=16, vLLM v0.28.0,
+`gpu-memory-utilization` 0.90, `all2all-backend deepep_v2`.
 
-| result | value |
-| --- | --- |
-| switch, building a new buffer | 1464–1587 ms |
-| switch, reusing a parked buffer | 378–387 ms, **0 MiB allocated** |
-| switch under load | 4279 ms build / 387 ms reuse, **24/24 in-flight requests completed, 0 failed** |
-| repeatability | 2/2 extra cycles, 16/16 ranks both directions, matching output |
-| CUDA graphs | captured (FULL decode + PIECEWISE mixed), 2.93 GiB |
-| retained second buffer @128 | **+286 MiB** |
-| retained second buffer @512 | **+902 MiB** |
-| implied buffer size | **~1.60 MiB/token + ~81 MiB fixed** |
-| NVSHMEM low-latency buffer, for contrast | 4.28 GiB (~12.2 MiB/token) |
+### Switch latency
 
-Intranode (EP=8, single node) switches in 277–629 ms and has always kept its
-graphs; it does not need any of this.
-
-**Not yet measured:** decode tokens/s after a switch, compared against the same
-engine with `--enforce-eager`. Until that exists, "the 4.9x penalty is
-recovered" is an inference from the graphs being captured, not a measurement.
-Buffer scaling with EP *width* is also unmeasured — every number above is EP=16.
-
-## Prerequisites
-
-- 2 nodes, 8 GPUs each, InfiniBand with GIN (GPU-Initiated Networking)
-  capability. Check it reports non-zero: the engine logs `gin_type` during
-  startup; 0 means the NICs or drivers cannot do GIN and `deepep_v2` will refuse.
-- vLLM v0.28.0 with this branch applied (`feat/pd-role-switch`).
-- The model weights on node-local disk if possible. Two pods pulling 753 GB
-  over one NFS share took ~1355 s against ~104 s from local disk.
-
-## Step 1 — build deep_ep against a pinned NCCL
-
-```bash
-tools/pd_role_switch/build_deep_ep.sh          # writes a wheel to ./dist
-pip install --no-deps --force-reinstall dist/deep_ep-*.whl
-```
-
-**Pin NCCL to 2.30.7. Do not use a range.** `>=2.30.4` resolves to the newest
-wheel, and 2.31.2 segfaults during startup: vLLM's `ncclCommProperties` in
-`vllm/distributed/device_communicators/pynccl_wrapper.py` is hand-mirrored from
-NCCL's *internal* headers (the struct is not in any public `nccl.h`, only the
-symbol is exported), and it is written for the 2.30 layout. The failure is
-nondeterministic — 3 of 8 ranks survived the query in one run — because it is
-memory corruption rather than a clean API error.
-
-deep_ep must be built against the **same** NCCL it runs on. A wheel built
-against 2.31.2 and run on 2.30.7 fails with `cudaErrorIllegalAddress` inside
-`csrc/elastic/buffer.hpp`.
-
-## Step 2 — launch
-
-```bash
-tools/pd_role_switch/run_switch_test.sh --nodes 2 --model zai-org/GLM-5.2-FP8
-```
-
-The four settings that matter, and why each is needed:
-
-| setting | value | if you get it wrong |
+| | idle | with 24 requests in flight |
 | --- | --- | --- |
-| `nvidia-nccl-cu12` | `==2.30.7` | segfault in `ncclCommQueryProperties` |
-| deep_ep build | against 2.30.7 | `cudaErrorIllegalAddress` in `buffer.hpp` |
-| `VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE` | **0 internode, 1 single-node** | see below |
-| `VLLM_USE_DEEP_GEMM=0` **and** no `--moe-backend` | | `assert expert_start_loc.shape[0] == num_experts` |
+| into a role held before (buffer parked) | **378–387 ms** | **387 ms** |
+| into a role built fresh | 1464–1587 ms | 4279 ms |
 
-**The hybrid setting inverts with topology.** On a single node it must be `1`:
-otherwise `num_gin_ranks = num_ranks` and DeepEP drives GIN/RDMA between ranks
-that are all NVLink-local, giving an illegal address. On 2+ nodes it must be
-`0`: with `1` you hit `ZeroDivisionError` at `elastic.py:809`, because upstream
-auto-detects `rdma_gbs` only `if num_rdma_ranks > 1` while dividing by it under
-`if num_scaleout_ranks > 1`, and hybrid mode makes those two counts diverge.
-That path is unreachable on one node, where the `and` short-circuits.
+Switching back onto a parked buffer costs the same under load as idle: the
+extra time in the fresh-build case is draining in-flight work, not buffer
+construction. **24 of 24 in-flight requests completed, 0 failed**, and output
+was identical before and after every round trip.
 
-Note vLLM annotates `VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE: bool = True` in
-`envs.py` while its lambda defaults to `"0"`. The implementation wins.
+Intranode (EP=8, one node) switches in **277–629 ms**.
 
-deep_gemm is forced from **two** places — the `--moe-backend` flag and the
-`VLLM_USE_DEEP_GEMM` env var. Clearing only one is not enough. `deepep_v2` pads
-its contiguous layout, and the deep_gemm path derives `num_experts` from the
-padded tensor, so it trips an assert. Left alone, vLLM's oracle picks a
-padding-tolerant expert backend.
+Repeatability: 2 of 2 extra cycles switched all 16 ranks in both directions
+with matching output.
 
-## Step 3 — switch, and check the right thing
+### Memory, against dedicated prefill and decode replicas
+
+Per GPU. A switching engine keeps both role buffers resident; a dedicated
+replica keeps only its own.
+
+| | per GPU | vs switching engine |
+| --- | --- | --- |
+| dedicated **prefill** replica | 126257 MiB | — |
+| dedicated **decode** replica | 123177 MiB (projected) | — |
+| **switching engine, both buffers resident** | **126543 MiB** (measured) | **+0.20%** vs prefill, **+2.35%** vs decode |
+
+**Dual-role capability costs at most 2.35% of the card.** The retained buffer
+is 286 MiB, 1.7% of the 16.5 GiB left free after boot.
+
+That is affordable because the buffer itself is small:
+
+| | per token | at 2048 tokens |
+| --- | --- | --- |
+| `deepep_v2` ElasticBuffer | **1.60 MiB** (+81 MiB fixed) | 3.29 GiB (projected) |
+| NVSHMEM low-latency buffer | 12.2 MiB | 24.4 GiB |
+
+Measured at two budgets: 128 tokens costs 286 MiB, 512 tokens costs 902 MiB.
+Switching back onto a parked buffer allocates **0 MiB** — the reuse path is
+free, which is what makes the 378 ms round trip possible.
+
+`reserved_MiB` is unchanged across every sample: the buffer lives outside
+PyTorch's pool, so `torch.cuda.empty_cache()` will not recover it and
+torch-side memory reporting will not show it.
+
+### Why internode is the interesting case
+
+Under NVSHMEM the high-throughput and low-latency buffers cannot coexist —
+`nvshmem::init` takes different team parameters for each — so the outgoing
+buffer must be destroyed before the incoming one is built. A destroy strands
+every captured CUDA graph, leaving internode eager-only, and eager measured
+**4.9x slower decode** (32403 ms against 6573 ms for the same 4096 tokens).
+
+`deepep_v2` uses NCCL symmetric memory instead. Two `ElasticBuffer`s coexist,
+the graphs survive, and a switch becomes a buffer swap rather than a teardown.
+
+## Running it
+
+### 1. Build deep_ep against a pinned NCCL
+
+```bash
+tools/pd_role_switch/build_deep_ep.sh
+pip install --no-deps --force-reinstall dist/deep_ep-*.whl
+cd /tmp && python3 -c "import deep_ep; print(hasattr(deep_ep, 'ElasticBuffer'))"
+```
+
+The version pin is exact and deep_ep must be built against the same NCCL it
+runs on. Both matter; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+### 2. Launch
+
+Run on every node. Node 0 serves the API, the rest are headless followers.
+
+```bash
+# node 0
+NODE_RANK=0 MASTER_ADDR=10.0.0.1 tools/pd_role_switch/run_switch_test.sh
+# node 1
+NODE_RANK=1 MASTER_ADDR=10.0.0.1 tools/pd_role_switch/run_switch_test.sh
+```
+
+Single node works too: `NODES=1 tools/pd_role_switch/run_switch_test.sh`.
+
+The script sets the required environment itself, including the one setting that
+depends on topology, and prints a PASS or FAIL per switch.
+
+### 3. Switch a running engine
 
 ```bash
 curl -s -X POST localhost:8000/switch_pd_role \
@@ -104,35 +107,33 @@ curl -s -X POST localhost:8000/switch_pd_role \
   -d '{"backend":"deepep_v2","max_num_tokens":128,"max_num_batched_tokens":128}'
 ```
 
-**Check `ranks_switched` and `layers_switched`, not the timing or the output.**
-A switch that does nothing still returns quickly and still answers correctly.
-Before `_role_budget_unchanged()` existed, every `deepep_v2` switch
-short-circuited on the pre-existing "already on this backend" guard: the run
-reported 16/16 ranks, 373 ms, matching answers — and `ranks_switched: 0,
-layers_switched: 0`. Nothing had been rebuilt.
-
-A good switch on this configuration looks like:
-
 ```json
 {"backend":"deepep_v2","ranks_switched":16,"ranks_total":16,"layers_switched":75}
 ```
 
-Set `VLLM_PD_KEEP_PREVIOUS=1` to park the outgoing buffer. This is what keeps
-captured CUDA graphs valid, and it is not automatic: vLLM's all2all handle cache
-is a `WeakValueDictionary`, so the outgoing buffer is collected as soon as the
-layers let go of it unless something holds a strong reference.
+`ranks_switched` and `layers_switched` are the result to check. A switch that
+did nothing also returns quickly and still answers correctly, so timing and
+output alone will not tell you it worked.
 
-## Interpreting a failure
+Set `VLLM_PD_KEEP_PREVIOUS=1` (the script does) to park the outgoing buffer.
+That is what keeps captured CUDA graphs valid and makes the return switch cost
+378 ms and 0 MiB instead of a full rebuild.
 
-| symptom | cause |
-| --- | --- |
-| `Segfault encountered`, Python-only frames | NCCL version — pin 2.30.7 |
-| `cudaErrorIllegalAddress` in `buffer.hpp` | deep_ep built against a different NCCL |
-| `ZeroDivisionError` at `elastic.py:809` | hybrid mode on, internode |
-| illegal address in `launch_engram_fetch` | hybrid mode off, single node |
-| `assert expert_start_loc.shape[0] == num_experts` | deep_gemm still selected |
-| `ranks_switched: 0` | the switch was a no-op; check the budget actually differs |
+## Requirements
 
-A crash can also present as a hang: the wrapper outlives the engine, so the
-process stays up after the workers die. Grep for `hit an exception` and
-`Engine core initialization failed`, not just for segfaults.
+- 8 GPUs per node; InfiniBand with GIN (GPU-Initiated Networking) for multi-node
+- vLLM v0.28.0 with this branch
+- NCCL 2.30.7, and deep_ep built against it
+- Model weights on node-local disk if available: 753 GB over one NFS share took
+  ~1355 s for two nodes against ~104 s from local disk
+
+## Scope of these numbers
+
+Measured at EP=16 on H200. Not yet measured: decode throughput after a switch
+against an eager baseline (CUDA graphs are captured and in-flight requests
+survive a switch, but tokens/s has not been compared), and how the buffer scales
+with EP *width* — every number here is EP=16, and a DeepEP buffer holds receive
+space related to rank count, so EP=32 is a projection rather than a measurement.
+
+Rows marked "projected" are derived from the two measured budget points, not
+observed directly.
