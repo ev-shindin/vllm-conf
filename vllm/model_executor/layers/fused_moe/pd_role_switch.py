@@ -102,7 +102,10 @@ logger = init_logger(__name__)
 # would be guessing.
 HIGH_THROUGHPUT = "deepep_high_throughput"
 LOW_LATENCY = "deepep_low_latency"
-SWITCHABLE_BACKENDS = (HIGH_THROUGHPUT, LOW_LATENCY)
+# One backend for both roles: under v2 the role is the token budget, not
+# the backend name, so a v2 switch is v2 -> v2 with a different budget.
+DEEPEP_V2 = "deepep_v2"
+SWITCHABLE_BACKENDS = (HIGH_THROUGHPUT, LOW_LATENCY, DEEPEP_V2)
 
 
 def ll_max_tokens_cap() -> int:
@@ -346,6 +349,14 @@ def _rounded_hidden_size(hidden_size: int, dtype: torch.dtype, backend: str) -> 
         return DeepEPHTPrepareAndFinalize.maybe_roundup_layer_hidden_size(
             hidden_size, dtype
         )
+    if backend == DEEPEP_V2:
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.deepep_v2 import (
+            DeepEPV2PrepareAndFinalize,
+        )
+
+        return DeepEPV2PrepareAndFinalize.maybe_roundup_layer_hidden_size(
+            hidden_size, dtype
+        )
     return DeepEPLLPrepareAndFinalize.maybe_roundup_layer_hidden_size(hidden_size)
 
 
@@ -524,6 +535,14 @@ def _swap_all2all_manager(backend: str, keep_previous: bool):
     assert device_communicator is not None
 
     previous = device_communicator.all2all_manager
+
+    # deepep_v2 serves both roles from one manager. The role lives in the
+    # buffer kwargs, so the rebuild alone produces a different ElasticBuffer;
+    # building a second DeepEPV2All2AllManager against the same group would
+    # add a redundant GIN rendezvous and change nothing.
+    if backend == device_communicator.all2all_backend:
+        return previous
+
     cached = getattr(device_communicator, "_role_switch_managers", None)
     if cached is None:
         cached = {}
@@ -556,6 +575,27 @@ def _swap_all2all_manager(backend: str, keep_previous: bool):
     device_communicator.all2all_manager = manager
     device_communicator.all2all_backend = backend
     return previous
+
+
+def _role_budget_unchanged(layers: list, max_num_tokens: int | None) -> bool:
+    """True when the layers already carry ``max_num_tokens``.
+
+    Under HT/LL the backend name is the role, so this only guards against a
+    redundant repeat. Under deepep_v2 one backend serves both roles and the
+    role IS the budget, so this is what makes a switch a switch: without it
+    the same-backend early return swallows every v2 call and no layer is
+    rebuilt.
+
+    A caller that passes None is asking for the backend default rather than
+    a specific budget, which cannot be compared here -- treat it as
+    unchanged and let the existing backend check decide.
+    """
+    if max_num_tokens is None:
+        return True
+    return all(
+        getattr(layer.moe_config, 'max_num_tokens', None) == max_num_tokens
+        for layer in layers
+    )
 
 
 def switch_all2all_backend(
@@ -614,8 +654,12 @@ def switch_all2all_backend(
 
     layers = check_switchable(model, backend, max_num_tokens, config, keep_previous)
     current = layers[0].moe_config.moe_parallel_config.all2all_backend
-    if current == backend:
-        logger.info("role switch: already on %s, nothing to do", backend)
+    if current == backend and _role_budget_unchanged(layers, max_num_tokens):
+        logger.info(
+            "role switch: already on %s at budget %s, nothing to do",
+            backend,
+            max_num_tokens,
+        )
         return 0
 
     if max_num_tokens is None:
