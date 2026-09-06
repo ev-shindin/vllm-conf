@@ -39,9 +39,14 @@ export VLLM_USE_DEEP_GEMM=0
 # handle cache (a WeakValueDictionary) lets it go and the return switch is a
 # full rebuild instead of 378 ms.
 export VLLM_PD_KEEP_PREVIOUS=${VLLM_PD_KEEP_PREVIOUS:-1}
-export VLLM_PD_ALLOW_CUDAGRAPHS=${VLLM_PD_ALLOW_CUDAGRAPHS:-1}
+# No VLLM_PD_ALLOW_CUDAGRAPHS here on purpose. check_switchable only consults
+# the cudagraph refusal when the outgoing buffer is NOT retained, so keeping it
+# is already sufficient -- setting the bypass as well would imply a test-only
+# escape hatch is required for normal use.
 
-mem_used () {  # driver-level MiB on GPU 0, same source as torch.cuda.mem_get_info
+mem_used () {  # driver-level MiB on GPU 0, same source as torch.cuda.mem_get_info.
+               # GPU 0 only, and it counts every process on that device -- read
+               # it on a node running nothing else.
   nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 2>/dev/null | tr -d ' '
 }
 

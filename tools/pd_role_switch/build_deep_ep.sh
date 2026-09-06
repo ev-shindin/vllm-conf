@@ -19,11 +19,10 @@ set -uo pipefail
 NCCL_VERSION=${NCCL_VERSION:-2.30.7}
 ARCH=${TORCH_CUDA_ARCH_LIST:-9.0}     # 9.0 = H100/H200 (sm_90)
 OUT=${OUT:-./dist}
+mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)   # absolutise: the build runs from a temp dir
 SRC_REF=${SRC_REF:-main}
 
 echo "### building deep_ep against NCCL ${NCCL_VERSION} for sm_${ARCH}"
-mkdir -p "$OUT"
-
 python3 -c "import importlib.metadata as m; print('### deep_ep before:', m.version('deep_ep'))" 2>/dev/null
 
 pip install -q --no-cache-dir "nvidia-nccl-cu12==${NCCL_VERSION}" || {
@@ -81,7 +80,7 @@ SRCDIR=$(ls -d "$TMP"/DeepEP-* 2>/dev/null | head -1)
 
 export TORCH_CUDA_ARCH_LIST="$ARCH"
 export MAX_JOBS=${MAX_JOBS:-$(nproc)}
-( cd "$SRCDIR" && pip wheel --no-build-isolation --no-deps -w "$OLDPWD/$OUT" . ) || {
+( cd "$SRCDIR" && pip wheel --no-build-isolation --no-deps -w "$OUT" . ) || {
   echo "### build failed"; exit 1; }
 
 echo "### wheel:"

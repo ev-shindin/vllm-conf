@@ -188,6 +188,38 @@ def _ll_buffer_bytes(
     return int((rdma + nvl + overhead) * _SIZING_SAFETY)
 
 
+def _v2_buffer_bytes(moe, group, max_num_tokens: int | None = None) -> int | None:
+    """Bytes the deepep_v2 ElasticBuffer will want, or None if unknowable.
+
+    Asks DeepEP rather than modelling it here, for the same reason the
+    low-latency path asks: the buffer depends on hidden size, topk and rank
+    count as well as the token budget, so a curve fitted on one model at one
+    EP width would be wrong elsewhere, and wrong in the unsafe direction.
+    """
+    try:
+        import deep_ep
+
+        from vllm import envs
+    except ImportError:
+        return None
+    if max_num_tokens is None:
+        max_num_tokens = moe.max_num_tokens
+    try:
+        nbytes = deep_ep.ElasticBuffer.get_buffer_size_hint(
+            group=group,
+            num_max_tokens_per_rank=max_num_tokens,
+            hidden=moe.hidden_dim,
+            num_topk=moe.experts_per_token,
+            allow_hybrid_mode=envs.VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE,
+            allow_multiple_reduction=(
+                envs.VLLM_DEEPEP_V2_ALLOW_MULTIPLE_REDUCTION
+            ),
+        )
+    except Exception:  # noqa: BLE001 - a hint we cannot get is not fatal
+        return None
+    return int(nbytes * _SIZING_SAFETY)
+
+
 def _live_handles(manager) -> list:
     """Strong references to the buffers ``manager`` currently owns.
 
@@ -278,7 +310,7 @@ def _precheck_memory(
     the outgoing role's value; sizing from it charged a 508-token low-latency
     switch for a 2048-token buffer and refused a switch that fits.
     """
-    if backend != LOW_LATENCY:
+    if backend not in (LOW_LATENCY, DEEPEP_V2):
         return
     if not torch.cuda.is_available():
         return
@@ -296,18 +328,36 @@ def _precheck_memory(
     # manager's own kwargs match, token budget included; a differing budget
     # misses the cache and builds a new buffer, which this precheck then sizes
     # correctly on the next call.
-    for handle in getattr(device_communicator, "_role_switch_handles", None) or []:
-        if bool(getattr(handle, "low_latency_mode", False)) == (
-            backend == LOW_LATENCY
-        ):
+    if backend == DEEPEP_V2:
+        # An ElasticBuffer does not report the budget it was built for, so a
+        # parked one cannot be matched against this request. Any park may be
+        # what get_or_create returns, in which case the switch allocates
+        # nothing -- and refusing it on a full-size estimate would repeat the
+        # false refusal the low-latency path hit, by 101 MiB, on an engine
+        # that had the memory it needed.
+        if getattr(device_communicator, "_role_switch_handles", None):
             return
+    else:
+        for handle in getattr(device_communicator, "_role_switch_handles", None) or []:
+            if bool(getattr(handle, "low_latency_mode", False)) == (
+                backend == LOW_LATENCY
+            ):
+                return
 
     manager = getattr(device_communicator, "all2all_manager", None)
     num_ranks = getattr(manager, "world_size", None)
     if num_ranks is None:
         return
 
-    needed = _ll_buffer_bytes(layers[0].moe_config, num_ranks, max_num_tokens)
+    if backend == DEEPEP_V2:
+        group = getattr(manager, "_device_group", None) or getattr(
+            manager, "cpu_group", None
+        )
+        needed = _v2_buffer_bytes(layers[0].moe_config, group, max_num_tokens)
+    else:
+        needed = _ll_buffer_bytes(
+            layers[0].moe_config, num_ranks, max_num_tokens
+        )
     if needed is None:
         return
 
@@ -321,7 +371,7 @@ def _precheck_memory(
     )
     mib = 1024 * 1024
     raise RoleSwitchError(
-        f"The low-latency buffer needs about {needed // mib} MiB and only "
+        f"The {backend} buffer needs about {needed // mib} MiB and only "
         f"{free // mib} MiB is free, so allocating it would take the engine "
         f"down rather than fail cleanly. It is linear in the token budget "
         f"(sized for {sized_for}), so lower that, "
@@ -654,7 +704,9 @@ def switch_all2all_backend(
 
     layers = check_switchable(model, backend, max_num_tokens, config, keep_previous)
     current = layers[0].moe_config.moe_parallel_config.all2all_backend
-    if current == backend and _role_budget_unchanged(layers, max_num_tokens):
+    if current == backend and (
+        backend != DEEPEP_V2 or _role_budget_unchanged(layers, max_num_tokens)
+    ):
         logger.info(
             "role switch: already on %s at budget %s, nothing to do",
             backend,
