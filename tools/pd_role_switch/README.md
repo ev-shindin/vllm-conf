@@ -59,6 +59,23 @@ free, which is what makes the 378 ms round trip possible.
 PyTorch's pool, so `torch.cuda.empty_cache()` will not recover it and
 torch-side memory reporting will not show it.
 
+### Decode throughput: what the graphs are worth
+
+Same topology, same benchmark placement (decode role after the switch), 16
+concurrent requests of 256 tokens each:
+
+| | decode of 4096 tokens |
+| --- | --- |
+| CUDA graphs retained across the switch | **10327 ms** |
+| same engine with `--enforce-eager` | 45233 ms |
+| **penalty for losing the graphs** | **4.38x** |
+
+That is the payoff. Internode under NVSHMEM is eager-only, so it pays this 4.38x
+on every decode; deepep_v2 keeps the graphs and does not.
+
+Token totals are derived from the request shape (16 x 256 with `ignore_eos`),
+not read back from the responses.
+
 ### Why internode is the interesting case
 
 Under NVSHMEM the high-throughput and low-latency buffers cannot coexist —
@@ -153,7 +170,7 @@ unexercised. Treat it as untested until a run with a connector confirms it.
 
 ## Scope of these numbers
 
-Measured at EP=16 on H200. Not yet measured: decode throughput after a switch
+Measured at EP=16 on H200. Not yet measured
 against an eager baseline (CUDA graphs are captured and in-flight requests
 survive a switch, but tokens/s has not been compared), and how the buffer scales
 with EP *width* — every number here is EP=16, and a DeepEP buffer holds receive
