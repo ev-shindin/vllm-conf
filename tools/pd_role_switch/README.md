@@ -365,6 +365,16 @@ Between steps 1 and 4 the replica serves nothing, which is the cost of doing it
 safely — bounded by the switch itself, a few hundred milliseconds, rather than
 the minutes a replacement replica would take.
 
+**And the standard llm-d guide cannot host this at all.** `llm-d.ai/role` is part
+of each role Deployment's `spec.selector`, which Kubernetes will not let you
+change. Relabelling a pod therefore does not move it between roles — it removes
+it from its owner, which promptly replaces it with a cold one. A switchable
+deployment has to keep the role out of every selector.
+
+[WELL-LIT-PATH-LLM-D.md](WELL-LIT-PATH-LLM-D.md) has the deployment shape that
+works (one Deployment, role as a mutable pod label), a full GLM-5.2 manifest,
+and the four-step handover.
+
 **Status: the engine half is built and measured. The controller half is not.**
 That is the gap between "one engine can change role in 378 ms" and "a fleet can
 change its P:D ratio in 378 ms".
