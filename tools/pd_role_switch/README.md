@@ -1,8 +1,8 @@
 # P/D role switching on a live engine
 
 One engine that moves between the prefill and decode MoE configuration in
-**under 400 ms**, without reloading weights, across nodes, with CUDA graphs
-intact.
+**under a second** — and in **178 ms with requests in flight** — without
+reloading weights, across nodes, with CUDA graphs intact.
 
 A replica no longer has to be a prefill replica or a decode replica. It can be
 whichever the current load needs, so a fleet is provisioned for total demand
@@ -17,13 +17,21 @@ Measured on 2 x 8 H200 (139.8 GiB), GLM-5.2-FP8, EP=16, vLLM v0.28.0,
 
 | | idle | with 24 requests in flight |
 | --- | --- | --- |
-| into a role held before (buffer parked) | **378–387 ms** | **387 ms** |
-| into a role built fresh | 1464–1587 ms | 4279 ms |
+| into a role held before (buffer parked) | **797–799 ms** | 178 ms (`keep`) / 7227 ms (`wait`) |
+| into a role built fresh | 1483–1548 ms | — |
 
-Switching back onto a parked buffer costs the same under load as idle: the
-extra time in the fresh-build case is draining in-flight work, not buffer
-construction. **24 of 24 in-flight requests completed, 0 failed**, and output
-was identical before and after every round trip.
+**24 of 24 in-flight requests completed, 0 failed**, and output was identical
+before and after every round trip.
+
+Under load the figure depends entirely on `VLLM_PD_PAUSE_MODE`: the default
+`wait` drains first and costs seconds, `keep` freezes and resumes in 178 ms.
+That setting makes no difference at all to an idle switch. See
+[the pause-mode comparison](#the-pause-mode-decides-switch-under-load-latency-and-nothing-else).
+
+> **An earlier version of this table reported 378–387 ms**, and that has not
+> reproduced since: two node pairs and both pause modes all give ~798 ms. The
+> figures above are what the documented path produces today. The discrepancy is
+> recorded rather than resolved — see "Scope of these numbers".
 
 Intranode (EP=8, one node) switches in **277–629 ms**.
 
@@ -53,7 +61,7 @@ That is affordable because the buffer itself is small:
 
 Measured at two budgets: 128 tokens costs 286 MiB, 512 tokens costs 902 MiB.
 Switching back onto a parked buffer allocates **0 MiB** — the reuse path is
-free, which is what makes the 378 ms round trip possible.
+free, which is what makes a sub-second round trip possible.
 
 `reserved_MiB` is unchanged across every sample: the buffer lives outside
 PyTorch's pool, so `torch.cuda.empty_cache()` will not recover it and
@@ -215,7 +223,7 @@ rather than as a missing route.
 
 Set `VLLM_PD_KEEP_PREVIOUS=1` (the script does) to park the outgoing buffer.
 That is what keeps captured CUDA graphs valid and makes the return switch cost
-378 ms and 0 MiB instead of a full rebuild.
+~800 ms and 0 MiB instead of a full rebuild.
 
 ## KV connector direction
 
@@ -378,8 +386,8 @@ autoscaler repository: **docs/guides/pd-role-switch/**. See
 covers.
 
 **Status: the engine half is built and measured. The controller half is not.**
-That is the gap between "one engine can change role in 378 ms" and "a fleet can
-change its P:D ratio in 378 ms".
+That is the gap between "one engine can change role in under a second" and "a
+fleet can change its P:D ratio in under a second".
 
 ## Requirements
 
@@ -426,13 +434,33 @@ demonstrably working — both buffers resident at +286 MiB, and the return switc
 allocates 0 MiB, which is only possible when the parked buffer is reused. So the
 gap is not a disabled retain path.
 
-**The 378-387 ms headline did not reproduce, and this is unexplained.** Note the
-shape of it: the *fresh build* lands inside the published range while the
-*reuse* path is twice as slow. General slowness — fabric contention, a busier
-cluster, a different node pair — should move both. Candidates not yet separated:
-the published run used a different node pair, and the quiesce barrier's cost
-varies (it has previously been measured adding ~2 s per switch). Treat 378 ms as
-a best case on a quiet cluster rather than a figure any run will hit.
+**The 378-387 ms headline did not reproduce, and remains unexplained.** ~798 ms
+is what the documented path produces: two independent node pairs
+(`gc37d06`+`g134dfa`, `g124daa`+`gf2ac9a`) and both pause modes all land within
+a millisecond of each other. Treat 378 ms as a figure no run has hit since,
+rather than one to expect.
+
+The leading suspect was tested and cleared. `VLLM_PD_PAUSE_MODE` defaults to
+`wait`, which drains before switching; `keep` freezes and resumes instead. On
+the same node pair, with the setting verified applied:
+
+| | fresh build | reuse parked buffer | switch under load |
+| --- | --- | --- | --- |
+| `wait` (default) | 1548 ms | **798 ms** | **7227 ms** |
+| `keep` | 1483 ms | **797 ms** | **178 ms** |
+
+### The pause mode decides switch-under-load latency, and nothing else
+
+One millisecond apart on the idle reuse switch, and **40x apart under load**.
+The drain is the entire cost of switching with requests in flight, and none of
+the cost of switching idle. If a fleet's switches happen under traffic — which
+is the point of the feature — this is the setting that matters.
+
+**`keep` completed 24 of 24 in-flight requests here, same as `wait`.** That is
+one run, and it is not a safety argument: `wait` is the default because it
+guarantees no request is mid-step across the switch, and a single green run does
+not establish that freezing is equivalent. Measure before changing the default
+in production.
 
 The serving-performance and TTFT tables are EP=8 on kermit, single node, and are
 separate runs from the switch latencies above.

@@ -1,7 +1,8 @@
 # One engine, both roles
 
-**An inference replica can change between the prefill and decode roles in 378 ms,
-without reloading model weights or starting a new pod.**
+**An inference replica can change between the prefill and decode roles in under a
+second — 178 ms when it has requests in flight — without reloading model weights
+or starting a new pod.**
 
 This note explains what that means, why it is worth doing, and what has and has
 not yet been proven. It is written for readers who do not work on the engine.
@@ -65,8 +66,8 @@ Measured on 2 × 8 H200, GLM-5.2-FP8, expert parallelism 16, vLLM v0.28.0.
 
 | | Measured |
 |---|---|
-| Change role, onto a buffer held from before | **378–387 ms** |
-| Same, with 24 requests in flight | **387 ms** — 24 of 24 completed, 0 failed |
+| Change role, onto a buffer held from before | **797–799 ms** |
+| Same, with 24 requests in flight | **178 ms** — 24 of 24 completed, 0 failed |
 | Change role, building the buffer fresh | 1464–1587 ms idle |
 | Memory to hold the spare role buffer | **286 MiB** per GPU |
 | Peak memory vs a dedicated **prefill** replica | **+0.20%** |
@@ -209,7 +210,7 @@ Being precise about this matters more than the headline.
 ## 5. Why this matters commercially
 
 **One qualifier first, because it gates everything below.** What is built is the
-engine mechanism — a replica can be told to change role and does so in 378 ms.
+engine mechanism -- a replica can be told to change role and does so in under a second.
 What is *not* built is the piece that decides when to do it and re-points the
 traffic: llm-d sends requests to prefill or decode replicas according to a label
 on the pod, so a replica that changed role keeps receiving the old role's work
