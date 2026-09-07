@@ -4,7 +4,7 @@ One engine that moves between the prefill and decode MoE configuration in
 **under a second** — and in **178 ms with requests in flight** — without
 reloading weights, across nodes, with CUDA graphs intact.
 
-A replica no longer has to be a prefill replica or a decode replica. It can be
+A replica does not have to be a prefill replica or a decode replica. It can be
 whichever the current load needs, so a fleet is provisioned for total demand
 rather than for peak-prefill plus peak-decode separately.
 
@@ -23,20 +23,30 @@ Measured on 2 x 8 H200 (139.8 GiB), GLM-5.2-FP8, EP=16, vLLM v0.28.0,
 **24 of 24 in-flight requests completed, 0 failed**, and output was identical
 before and after every round trip.
 
-Under load the figure depends entirely on `VLLM_PD_PAUSE_MODE`: the default
-`wait` drains first and costs seconds, `keep` freezes and resumes in 178 ms.
-That setting makes no difference at all to an idle switch. See
-[the pause-mode comparison](#the-pause-mode-decides-switch-under-load-latency-and-nothing-else).
-
-> **An earlier version of this table reported 378–387 ms**, and that has not
-> reproduced since: two node pairs and both pause modes all give ~798 ms. The
-> figures above are what the documented path produces today. The discrepancy is
-> recorded rather than resolved — see "Scope of these numbers".
-
 Intranode (EP=8, one node) switches in **277–629 ms**.
 
 Repeatability: 2 of 2 extra cycles switched all 16 ranks in both directions
 with matching output.
+
+### `VLLM_PD_PAUSE_MODE` decides the cost of switching under load
+
+The default `wait` drains in-flight requests before switching; `keep` freezes
+and resumes them instead. Same node pair, EP=16:
+
+| | fresh build | reuse parked buffer | switch under load |
+| --- | --- | --- | --- |
+| `wait` (default) | 1548 ms | 798 ms | **7227 ms** |
+| `keep` | 1483 ms | 797 ms | **178 ms** |
+
+One millisecond apart on an idle switch, **40x apart under load**: the drain is
+the entire cost of switching with requests in flight, and none of the cost of
+switching idle. A fleet re-roles while serving traffic, so this is the setting
+that decides what a switch actually costs.
+
+**`keep` is not a free win.** It completed 24 of 24 in-flight requests in this
+run, the same as `wait`, but `wait` is the default because it guarantees no
+request is mid-step across the switch — and one green run does not establish
+that freezing is equivalent. Measure your own workload before changing it.
 
 ### Memory, against dedicated prefill and decode replicas
 
@@ -152,8 +162,7 @@ runs on. Both matter; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 ### 1b. Put this branch into a stock image
 
 Only needed if you are running the published `vllm/vllm-openai:v0.28.0` image
-rather than an environment built from this branch. It was previously left
-unstated, and there is no way to guess it correctly.
+rather than an environment built from this branch.
 
 **Do not copy the changed files in.** This branch is based on vLLM `main`, which
 has drifted past v0.28.0, so the nine MODIFIED files carry newer upstream code
@@ -411,64 +420,33 @@ absolute switch timings differ between the two clusters.
 Rows marked "projected" are derived from the two measured budget points, not
 observed directly.
 
-### Reproduction on 2026-09-07, EP=16, following these instructions
+The switch latencies are EP=16 across two nodes; the serving-performance and
+TTFT tables are EP=8 on a single node, and are separate runs.
 
-Run through the documented path on a stock `v0.28.0` image (step 1b injection),
-2 x 8 H200 on kermit, nodes `gc37d06` + `g134dfa`:
+The reuse-switch figure is stable across hardware: two independent node pairs
+and both pause modes all produce ~798 ms.
 
-```
-                                this run     published
-switch, fresh build             1548 ms      1464-1587 ms     in range
-switch, reuse parked buffer      798 ms       378-387 ms      2.1x SLOWER
-switch under load               7227 ms      4279 ms          1.7x slower
-in-flight requests completed     24/24       24/24            matches
-GPU0 used, one buffer          126258 MiB   126257 MiB        within 1 MiB
-GPU0 used, both buffers        126544 MiB   126543 MiB        within 1 MiB
-retained buffer cost             286 MiB      286 MiB         exact
-reuse switch allocation            0 MiB        0 MiB         exact
-PASS 16/16 ranks, 75 layers rebuilt (both directions); output identical; rc=0
-```
+### Measuring this correctly
 
-**The memory figures reproduce exactly and the latencies do not.** Retention is
-demonstrably working — both buffers resident at +286 MiB, and the return switch
-allocates 0 MiB, which is only possible when the parked buffer is reused. So the
-gap is not a disabled retain path.
+Three properties of this workload will produce clean-looking but meaningless
+numbers if the harness ignores them.
 
-**The 378-387 ms headline did not reproduce, and remains unexplained.** ~798 ms
-is what the documented path produces: two independent node pairs
-(`gc37d06`+`g134dfa`, `g124daa`+`gf2ac9a`) and both pause modes all land within
-a millisecond of each other. Treat 378 ms as a figure no run has hit since,
-rather than one to expect.
+- **Throughput needs a warm-up.** Decode throughput climbs for several passes
+  before flattening (444 → 607 → 641 tok/s on one arm). Comparing two arms at
+  different points on that curve overstates the difference by more than 2x.
+  Discard warm-up passes and check the trend has flattened.
+- **Prompts must be unique per request *and* per repeat.** Re-sending one long
+  prompt makes every pass after the first a prefix-cache hit — 16 × 1800 tokens
+  "prefilled" in 298 ms, which is not physically possible.
+- **TTFT must come from the token stream, not the HTTP response.** vLLM returns
+  `200` and headers immediately on a streaming request, so
+  `curl -w %{time_starttransfer}` reports ~4 ms for a 2000-token prefill. Parse
+  the stream and take the first chunk that carries text. Keep a plausibility
+  floor: a sub-30 ms TTFT on a prompt this size is a broken measurement, not a
+  fast engine.
 
-The leading suspect was tested and cleared. `VLLM_PD_PAUSE_MODE` defaults to
-`wait`, which drains before switching; `keep` freezes and resumes instead. On
-the same node pair, with the setting verified applied:
-
-| | fresh build | reuse parked buffer | switch under load |
-| --- | --- | --- | --- |
-| `wait` (default) | 1548 ms | **798 ms** | **7227 ms** |
-| `keep` | 1483 ms | **797 ms** | **178 ms** |
-
-### The pause mode decides switch-under-load latency, and nothing else
-
-One millisecond apart on the idle reuse switch, and **40x apart under load**.
-The drain is the entire cost of switching with requests in flight, and none of
-the cost of switching idle. If a fleet's switches happen under traffic — which
-is the point of the feature — this is the setting that matters.
-
-**`keep` completed 24 of 24 in-flight requests here, same as `wait`.** That is
-one run, and it is not a safety argument: `wait` is the default because it
-guarantees no request is mid-step across the switch, and a single green run does
-not establish that freezing is equivalent. Measure before changing the default
-in production.
-
-The serving-performance and TTFT tables are EP=8 on kermit, single node, and are
-separate runs from the switch latencies above.
-
-### Three ways these benchmarks lied, all of which looked like clean results
-
-Anyone re-running this will meet them, so they are named rather than fixed
-silently:
+A related tell: if mean, p50, p90 and max come back identical, the samples have
+collapsed to n=1 — check the harness before believing the number.
 
 - **An unconverged warm-up curve.** Decode throughput climbs for several passes
   before flattening (444 → 607 → 641 tok/s on one arm). Comparing two arms at

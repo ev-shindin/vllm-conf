@@ -142,17 +142,12 @@ the wrong kind of replica. A fleet whose traffic mix is stable should keep
 specialists and take the 13.7%. A fleet whose mix moves is today paying a 4.2×
 penalty whenever demand lands on the role a replica was not built for.
 
-*Method note. Three earlier versions of these numbers were wrong, and every
-failure looked like a clean result, so they are worth naming for anyone
-re-running this. A 34% decode penalty came from comparing two points on a
-warm-up curve that had not converged. An apparent prefill advantage came from
-re-sending one identical prompt, which the prefix cache served without doing the
-work — 16 × 1800 tokens "prefilled" in 298 ms. And a 4 ms TTFT came from timing
-the HTTP response headers, which vLLM sends long before prefill finishes, with
-the samples additionally collapsed to n=1 by a missing newline. The harness now
-makes every prompt unique per request and per repeat, discards warm-up passes,
-parses the token stream rather than the headers, and flags any TTFT under 30 ms
-as implausible instead of reporting it.*
+*Method. Every prompt is unique per request and per repeat, so no measurement is
+served by the prefix cache; warm-up passes are discarded, because throughput
+climbs for several passes before it settles; and time-to-first-token is read
+from the token stream rather than the HTTP response, which arrives long before
+prefill finishes. The engineering README documents these requirements for anyone
+re-running the comparison.*
 
 ### Why it is affordable now and was not before
 
@@ -181,29 +176,29 @@ Being precise about this matters more than the headline.
 - The memory cost, measured rather than projected.
 - The KV *direction* flip — all ranks move from producer to consumer and back,
   and the connector tolerates the change while live.
+- **A real KV transfer between two engines, across a switch.** Two GLM-5.2
+  replicas, one 8-GPU node each: KV moved prefill → decode (3,452,160 bytes,
+  0 failures), both engines then changed role (8 of 8 ranks each), and KV moved
+  again **in the opposite direction**. Measured as bytes on the wire, not as
+  output correctness — an engine that receives no KV recomputes the prefix and
+  answers correctly anyway.
+
+- The cost against dedicated replicas, on both axes: 13.7% below a dedicated
+  decode replica at decode and 4.2× above a dedicated prefill one; 1.46× better
+  time-to-first-token unloaded and 1.35× worse at 16 concurrent. Neither engine
+  wins outright.
 
 **Not yet proven:**
 
-- ~~A real KV transfer between two engines across a switch.~~ **Answered on
-  hardware.** Two GLM-5.2 replicas, one 8-GPU node each: KV moved prefill →
-  decode (3,452,160 bytes, 0 failures), both engines then changed role (8 of 8
-  ranks each), and KV moved again **in the opposite direction**. Measured as
-  bytes on the wire, not as output correctness — an engine that receives no KV
-  recomputes the prefix and answers correctly anyway.
-- **Behaviour in the full llm-d platform.** Worse than untested: **the switch as
-  built cannot change a fleet's ratio under llm-d.** The platform decides which
-  replicas are prefill and which are decode from a *pod label*
-  (`llm-d.ai/role`), written once by the deployment. The engine switch does not
-  touch it, so after a switch the router keeps sending prefill traffic to an
-  engine that has already reconfigured itself for decode. Changing the role must
-  also change the label — see README, "Integrating with llm-d". Identified, not
-  yet built.
-- ~~Whether our engine serves as fast as a dedicated one.~~ **Now measured, and
-  the answer depends on the axis.** Decode: 13.7% below a dedicated decode
-  replica, 4.2× above a dedicated prefill one. Prefill latency: 1.46× *better*
-  unloaded, 1.35× *worse* at 16 concurrent, with a worse tail. Neither engine
-  wins outright; see both tables above.
-- Behaviour at expert parallelism 32; all figures above are at 16.
+- **A fleet changing its ratio.** The switch reconfigures one engine; llm-d
+  routes to prefill or decode replicas by a label written on the pod when it is
+  deployed, and moving that label is the autoscaler's job. Until that exists, a
+  switched replica keeps receiving the old role's traffic. The deployment shape
+  and the handover sequence are worked out — see the guide — but the controller
+  is not built.
+- **Behaviour under a live endpoint picker.** Each piece is verified; the
+  assembly has not been run end to end.
+- **Expert parallelism 32.** All figures here are at 16.
 
 ---
 

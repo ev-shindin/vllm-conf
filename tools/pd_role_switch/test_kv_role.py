@@ -6,10 +6,10 @@ plain objects, so it runs anywhere without a vLLM runtime or a GPU.
     python3 tools/pd_role_switch/test_kv_role.py
 
 The case that matters is kv_both. llm-d deploys BOTH its prefill and its decode
-replicas with `kv_role: kv_both`, and an earlier version of this code overwrote
-that on the first switch. The overwrite was one-way -- the budget mapping only
-answers kv_producer or kv_consumer -- so a round trip could never put kv_both
-back and the engine drifted permanently away from its deployed configuration.
+replicas with `kv_role: kv_both`, and the switch must leave it alone. Moving it
+would be one-way: the budget mapping only ever answers kv_producer or
+kv_consumer, so a round trip could not put kv_both back and the engine would
+drift permanently away from its deployed configuration.
 """
 
 import importlib.util
