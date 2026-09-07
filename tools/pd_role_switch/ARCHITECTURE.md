@@ -208,14 +208,18 @@ Being precise about this matters more than the headline.
 
 ## 5. Why this matters commercially
 
-**One qualifier first, because it gates everything below.** The engine mechanism
-is proven; the *fleet* benefit is not yet reachable on the llm-d platform. llm-d
-routes requests to prefill or decode replicas using a label written on the pod
-when it is deployed, and changing the engine's role does not change that label.
-Until the switch also moves the label, a switched replica keeps receiving the
-old role's traffic and the fleet ratio does not move. That work is understood
-and scoped — see section 4 — but it is not built, so the benefits below are
-what this unlocks, not what it delivers today.
+**One qualifier first, because it gates everything below.** What is built is the
+engine mechanism — a replica can be told to change role and does so in 378 ms.
+What is *not* built is the piece that decides when to do it and re-points the
+traffic: llm-d sends requests to prefill or decode replicas according to a label
+on the pod, so a replica that changed role keeps receiving the old role's work
+until something moves that label.
+
+That piece belongs to the autoscaler, which already watches the load and has the
+permissions to change a replica's labels. The engine deliberately does not do it
+itself. So this is a component that plugs into the existing control loop, not a
+new system — but until it is built, the benefits below are what this unlocks
+rather than what it delivers today.
 
 - **Provision for total demand, not for two peaks.** A fixed split must size
   prefill for peak prefill *and* decode for peak decode. One pool that re-roles

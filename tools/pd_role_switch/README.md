@@ -318,26 +318,42 @@ So after `POST /switch_pd_role` on an llm-d-managed pod:
 The fleet's effective P:D ratio — the thing the feature exists to change — does
 not move at all.
 
-**What a working integration needs.** The switch has to patch its own pod's
-`llm-d.ai/role`, which means a ServiceAccount with `patch` on pods, the pod's own
-name and namespace via the downward API, and a flag so non-llm-d deployments are
-unaffected. Membership itself is safe: the pool selector is `llm-d.ai/guide`,
-which does not change, so the pod is never ejected from the pool.
+**This belongs to the autoscaler, not to the engine.** `/switch_pd_role` is a
+mechanism: it changes one engine and knows nothing about Kubernetes. Deciding
+*when* to change the ratio, choosing which replica to convert, and moving the
+label are policy and orchestration, and they belong to the controller that
+already watches the metrics and holds RBAC on pods. Having the engine patch its
+own label would put Kubernetes write credentials inside every inference pod for
+no good reason.
 
-**Ordering is the subtle part, and neither obvious order is correct:**
+So the division is:
 
-- relabel first, and the router stops sending prefill work while the engine is
-  still in the prefill configuration;
-- switch the engine first, and the router keeps sending prefill work to an
-  engine that has already dropped to a decode budget.
+| | owns |
+| --- | --- |
+| engine (this branch) | `POST /switch_pd_role` — reconfigure in place, report `ranks_switched` |
+| autoscaler | the ratio decision, replica selection, label, drain, ordering |
 
-Either way there is a window in which routing and configuration disagree. The
-sequence has to be drain, relabel, wait for the picker to observe the change,
-then switch — and the picker's observation is an informer update, so the wait is
-small but not zero.
+**The sequence the controller runs**, which also removes the ordering hazard —
+the trick is that a converting replica should belong to *neither* role for the
+duration, rather than being handed straight from one to the other:
 
-**Status: identified, not built.** This is the gap between "one engine can change
-role in 378 ms" and "a fleet can change its P:D ratio in 378 ms".
+1. take the replica out of its current role (change or remove `llm-d.ai/role`)
+   so the endpoint picker stops selecting it — it stays in the pool, because the
+   pool selector is `llm-d.ai/guide` and that does not change;
+2. let in-flight requests drain (the engine survives a switch under load, so
+   this is for tidiness rather than safety);
+3. `POST /switch_pd_role` and check `ranks_switched` equals the rank count —
+   a switch that did nothing also returns quickly and still answers correctly;
+4. set `llm-d.ai/role` to the new role; the picker's informer observes it and
+   traffic resumes in the new direction.
+
+Between steps 1 and 4 the replica serves nothing, which is the cost of doing it
+safely — bounded by the switch itself, a few hundred milliseconds, rather than
+the minutes a replacement replica would take.
+
+**Status: the engine half is built and measured. The controller half is not.**
+That is the gap between "one engine can change role in 378 ms" and "a fleet can
+change its P:D ratio in 378 ms".
 
 ## Requirements
 
