@@ -183,10 +183,12 @@ Being precise about this matters more than the headline.
 
 **Not yet proven:**
 
-- **A real KV transfer between two engines across a switch.** Every switch
-  measurement so far is one engine. We have separately confirmed that KV does
-  move between a prefill and a decode engine (3.5 MiB, 0 failures, measured on
-  the wire), but not yet across a role change. This is the main open claim.
+- ~~A real KV transfer between two engines across a switch.~~ **Answered on
+  hardware.** Two GLM-5.2 replicas, one 8-GPU node each: KV moved prefill →
+  decode (3,452,160 bytes, 0 failures), both engines then changed role (8 of 8
+  ranks each), and KV moved again **in the opposite direction**. Measured as
+  bytes on the wire, not as output correctness — an engine that receives no KV
+  recomputes the prefix and answers correctly anyway.
 - **Behaviour in the full llm-d platform.** Worse than untested: **the switch as
   built cannot change a fleet's ratio under llm-d.** The platform decides which
   replicas are prefill and which are decode from a *pod label*
@@ -205,6 +207,15 @@ Being precise about this matters more than the headline.
 ---
 
 ## 5. Why this matters commercially
+
+**One qualifier first, because it gates everything below.** The engine mechanism
+is proven; the *fleet* benefit is not yet reachable on the llm-d platform. llm-d
+routes requests to prefill or decode replicas using a label written on the pod
+when it is deployed, and changing the engine's role does not change that label.
+Until the switch also moves the label, a switched replica keeps receiving the
+old role's traffic and the fleet ratio does not move. That work is understood
+and scoped — see section 4 — but it is not built, so the benefits below are
+what this unlocks, not what it delivers today.
 
 - **Provision for total demand, not for two peaks.** A fixed split must size
   prefill for peak prefill *and* decode for peak decode. One pool that re-roles

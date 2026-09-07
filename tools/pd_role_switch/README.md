@@ -271,9 +271,24 @@ check passes a completely broken transfer. Match the metric name up to `{`: a
 bare prefix match also catches Prometheus's `_created` series, whose value is an
 epoch timestamp, which once reported `failed=1788776689` for zero real failures.
 
-Still open: this pair had not switched roles. A transfer **across** a role
-change, with the direction reversed, is the one claim on this branch that
-hardware has not yet answered.
+### KV still moves after both engines change role
+
+The above pair had not switched. This one did — GLM-5.2-FP8, one 8-GPU node per
+replica, EP=8 each, `NixlConnector`, two phases against the same two engines:
+
+```
+phase 1  prefill -> decode      decode node   1 transfer  3452160 B  0 failed
+switch both engines             8/8 ranks each way
+phase 2  roles reversed         prefill node  1 transfer  3452160 B  0 failed
+```
+
+In phase 2 the transfer is booked on the node that used to be the prefiller,
+because it is the decoder now and the connector pulls. Answers were correct in
+both phases — which is not the assertion, for the reason above.
+
+**Read the caveat with the result.** Phase 2 worked because the proxy was
+re-pointed at the new roles. Under llm-d nothing does that; see the next
+section, which is the real remaining gap.
 
 ## Integrating with llm-d: the switch must also move the pod label
 
