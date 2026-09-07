@@ -156,9 +156,18 @@ Connectors that read `kv_role` once at construction (`MooncakeConnector`,
 config. NIXL reads it per call, so the flip is a declaration of intent and
 nothing is torn down.
 
-**Not yet verified on hardware.** Every measurement in this document ran with no
-KV connector attached, so the direction flip is implemented and reviewed but
-unexercised. Treat it as untested until a run with a connector confirms it.
+Verified on hardware: EP=8 with a NixlConnector attached, all 8 ranks moved
+`kv_producer -> kv_consumer` on the switch to the smaller budget and back again
+on the return, with identical output across the round trip.
+
+```
+role switch: kv_role kv_producer -> kv_consumer for NixlConnector   (x8 ranks)
+role switch: kv_role kv_consumer -> kv_producer for NixlConnector   (x8 ranks)
+```
+
+That exercises the direction flip and shows NixlConnector tolerates a live
+`kv_role` change. It does not exercise an actual KV transfer between a prefill
+and a decode replica, which needs two engines and a disaggregated setup.
 
 ## Requirements
 
