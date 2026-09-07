@@ -87,7 +87,12 @@ vllm serve "$MODEL" $ROLEFLAGS \
 ENGINE_PID=$!
 
 if [ "$NODE_RANK" != "0" ]; then
-  wait $ENGINE_PID          # followers serve no API; hold them open
+  # Followers serve no API, so nothing in this script will ever stop one. On a
+  # shared cluster an orphaned follower -- leader crashed, or never scheduled --
+  # then holds its GPUs indefinitely. Cap the wait so it always releases them.
+  ( sleep "${FOLLOWER_MAX_S:-7200}"; echo "### follower cap reached, releasing GPUs"; \
+    kill $ENGINE_PID 2>/dev/null ) &
+  wait $ENGINE_PID
   exit 0
 fi
 

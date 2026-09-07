@@ -187,8 +187,14 @@ Being precise about this matters more than the headline.
   measurement so far is one engine. We have separately confirmed that KV does
   move between a prefill and a decode engine (3.5 MiB, 0 failures, measured on
   the wire), but not yet across a role change. This is the main open claim.
-- **Behaviour in the full llm-d platform**, with the real request router, rather
-  than a test proxy.
+- **Behaviour in the full llm-d platform.** Worse than untested: **the switch as
+  built cannot change a fleet's ratio under llm-d.** The platform decides which
+  replicas are prefill and which are decode from a *pod label*
+  (`llm-d.ai/role`), written once by the deployment. The engine switch does not
+  touch it, so after a switch the router keeps sending prefill traffic to an
+  engine that has already reconfigured itself for decode. Changing the role must
+  also change the label — see README, "Integrating with llm-d". Identified, not
+  yet built.
 - ~~Whether our engine serves as fast as a dedicated one.~~ **Now measured, and
   the answer depends on the axis.** Decode: 13.7% below a dedicated decode
   replica, 4.2× above a dedicated prefill one. Prefill latency: 1.46× *better*

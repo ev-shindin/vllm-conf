@@ -275,6 +275,55 @@ Still open: this pair had not switched roles. A transfer **across** a role
 change, with the direction reversed, is the one claim on this branch that
 hardware has not yet answered.
 
+## Integrating with llm-d: the switch must also move the pod label
+
+**In an llm-d deployment the engine switch alone does nothing useful, and is
+actively harmful.** llm-d decides which endpoints are prefill and which are
+decode from a **pod label**, not from anything the engine reports:
+
+```
+llm-d.ai/guide=<pool>      # InferencePool selector -- unchanged by a switch
+llm-d.ai/role=prefill      # what the endpoint picker filters on
+llm-d.ai/model=<model>
+```
+
+The InferencePool selects on `llm-d.ai/guide`, and the endpoint picker's
+`prefill-filter` / `decode-filter` split that set by `llm-d.ai/role`. That label
+is written by the Deployment template and is static for the pod's lifetime.
+Nothing in this branch touches it (`grep -r 'llm-d.ai/role' vllm/` returns
+nothing).
+
+So after `POST /switch_pd_role` on an llm-d-managed pod:
+
+- the engine is reconfigured (budget, buffer, KV direction), but
+- the router still believes it holds the old role, so
+- an engine now running a 128-token decode budget keeps receiving prefill
+  traffic with multi-thousand-token prompts.
+
+The fleet's effective P:D ratio — the thing the feature exists to change — does
+not move at all.
+
+**What a working integration needs.** The switch has to patch its own pod's
+`llm-d.ai/role`, which means a ServiceAccount with `patch` on pods, the pod's own
+name and namespace via the downward API, and a flag so non-llm-d deployments are
+unaffected. Membership itself is safe: the pool selector is `llm-d.ai/guide`,
+which does not change, so the pod is never ejected from the pool.
+
+**Ordering is the subtle part, and neither obvious order is correct:**
+
+- relabel first, and the router stops sending prefill work while the engine is
+  still in the prefill configuration;
+- switch the engine first, and the router keeps sending prefill work to an
+  engine that has already dropped to a decode budget.
+
+Either way there is a window in which routing and configuration disagree. The
+sequence has to be drain, relabel, wait for the picker to observe the change,
+then switch — and the picker's observation is an informer update, so the wait is
+small but not zero.
+
+**Status: identified, not built.** This is the gap between "one engine can change
+role in 378 ms" and "a fleet can change its P:D ratio in 378 ms".
+
 ## Requirements
 
 - 8 GPUs per node; InfiniBand with GIN (GPU-Initiated Networking) for multi-node
