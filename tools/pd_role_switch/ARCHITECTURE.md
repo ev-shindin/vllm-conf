@@ -109,21 +109,49 @@ Two findings are solid — tight spreads, non-overlapping ranges:
   configuration. Our engine turns in roughly 410 tok/s of decode in *either*
   configuration — the specialists swing between 99 and 472.
 
-**The prefill column is not conclusive.** Every pair overlaps and one arm ranges
-from 15 to 59 tok/s. These runs use only 8 output tokens, so wall time is
-dominated by prompt processing and is correspondingly noisy. No claim about
-relative prefill throughput should be drawn from this table.
+**Ignore the prefill column above** — it counts *output* tokens, and prefill's
+product is the *first* token. Prefill belongs in latency, measured separately
+below.
+
+### Prefill, measured as latency (TTFT)
+
+Time from sending the request to the first streamed chunk that carries text.
+Same arms, same unique-prompt discipline, 1500-word prompts, 5 measured passes.
+
+| Prefill role | TTFT, one request at a time | TTFT, 16 concurrent | p90 at 16 |
+|---|---|---|---|
+| Dedicated **prefill** replica | 533.6 ms (525–538) | **973.6 ms** | **1360 ms** |
+| **Ours** in the prefill role | **364.8 ms** (360–369) | 1311.2 ms | 1915 ms |
+
+**The comparison reverses with load, so neither engine is simply better:**
+
+- **Unloaded, ours reaches the first token 1.46× sooner** — 365 ms against
+  534 ms, with both arms holding a ±5 ms spread.
+- **Under 16 concurrent prompts, ours is 1.35× slower**, and its tail is worse
+  still: p90 of 1915 ms against 1360 ms.
+
+This fits the kernel difference. The general-purpose kernel we are obliged to
+use handles a single sequence very well; the batched kernel a dedicated replica
+uses scales better across a concurrent batch. For an interactive, low-concurrency
+prefill path ours is the faster engine; for a saturated prefill fleet it is not,
+and the p90 is the number to watch.
 
 So the trade is **13.7% of peak decode throughput** in exchange for never being
 the wrong kind of replica. A fleet whose traffic mix is stable should keep
 specialists and take the 13.7%. A fleet whose mix moves is today paying a 4.2×
 penalty whenever demand lands on the role a replica was not built for.
 
-*Method note: an earlier version of this section reported a 34% decode penalty
-and a prefill advantage. Both were artefacts — the first from comparing points
-on an unconverged warm-up curve, the second from re-sending an identical prompt,
-which the prefix cache served without doing the prefill work. The figures above
-come from the corrected harness, which fails loudly if prompts repeat.*
+*Method note. Three earlier versions of these numbers were wrong, and every
+failure looked like a clean result, so they are worth naming for anyone
+re-running this. A 34% decode penalty came from comparing two points on a
+warm-up curve that had not converged. An apparent prefill advantage came from
+re-sending one identical prompt, which the prefix cache served without doing the
+work — 16 × 1800 tokens "prefilled" in 298 ms. And a 4 ms TTFT came from timing
+the HTTP response headers, which vLLM sends long before prefill finishes, with
+the samples additionally collapsed to n=1 by a missing newline. The harness now
+makes every prompt unique per request and per repeat, discards warm-up passes,
+parses the token stream rather than the headers, and flags any TTFT under 30 ms
+as implausible instead of reporting it.*
 
 ### Why it is affordable now and was not before
 
@@ -161,11 +189,11 @@ Being precise about this matters more than the headline.
   the wire), but not yet across a role change. This is the main open claim.
 - **Behaviour in the full llm-d platform**, with the real request router, rather
   than a test proxy.
-- ~~Whether our engine serves as fast as a dedicated one.~~ **Now measured:
-  13.7% less decode throughput than a dedicated decode replica, and 4.2× more
-  than a dedicated prefill replica.** See the throughput table above. Relative
-  *prefill* throughput remains unresolved — that workload was too noisy to
-  separate the arms.
+- ~~Whether our engine serves as fast as a dedicated one.~~ **Now measured, and
+  the answer depends on the axis.** Decode: 13.7% below a dedicated decode
+  replica, 4.2× above a dedicated prefill one. Prefill latency: 1.46× *better*
+  unloaded, 1.35× *worse* at 16 concurrent, with a worse tail. Neither engine
+  wins outright; see both tables above.
 - Behaviour at expert parallelism 32; all figures above are at 16.
 
 ---
