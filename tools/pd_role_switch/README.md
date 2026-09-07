@@ -222,8 +222,22 @@ That is what keeps captured CUDA graphs valid and makes the return switch cost
 A role change is also a KV direction change: prefill produces KV, decode
 consumes it. When a KV connector is configured, the switch moves
 `kv_transfer_config.kv_role` with the role -- `kv_producer` when the budget
-grows, `kv_consumer` when it shrinks -- so `kv_both`, which is deprecated for
-NixlConnector, is not required.
+grows, `kv_consumer` when it shrinks.
+
+**An engine deployed as `kv_both` is left alone.** `kv_both` already covers both
+directions, which is exactly what a switchable engine needs, and it is what
+**llm-d sets on both its prefill and its decode replicas** — so this is the
+common case in a real deployment, not a corner. Overwriting it would also be
+one-way: the budget mapping only ever answers `kv_producer` or `kv_consumer`, so
+a round trip could never restore `kv_both` and the engine would drift
+permanently away from its deployed configuration on the first switch.
+
+`tools/pd_role_switch/test_kv_role.py` covers these rules and needs no GPU or
+vLLM runtime:
+
+```bash
+python3 tools/pd_role_switch/test_kv_role.py
+```
 
 The response reports it:
 

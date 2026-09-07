@@ -151,8 +151,9 @@ def _switch_kv_role(
     role now in effect, or None when there is no connector to point.
 
     Prefill produces KV and decode consumes it, so a role change is also a
-    direction change. kv_role='kv_both' still works but is deprecated with
-    NixlConnector and slated for removal.
+    direction change -- unless the engine was deployed as kv_both, which already
+    covers both directions and is left untouched. That is not a corner case:
+    llm-d sets kv_both on both its prefill and its decode replicas.
 
     Safe as a plain assignment for NIXL: across base_worker, pull_worker,
     push_worker and both schedulers, kv_role is read exactly once -- a
@@ -165,6 +166,15 @@ def _switch_kv_role(
     cfg = getattr(engine_core.vllm_config, "kv_transfer_config", None)
     if cfg is None or getattr(cfg, "kv_connector", None) is None:
         return None
+    # An engine deployed with kv_both already serves both directions -- that is
+    # what the value means, and it is what llm-d sets on BOTH of its roles. Two
+    # reasons to leave it exactly as found. It is a deliberate operator choice,
+    # and overwriting it is one-way: _kv_role_for_budget only ever answers
+    # kv_producer or kv_consumer, so a round trip could never restore kv_both
+    # and the engine would drift permanently away from its deployed config on
+    # the first switch.
+    if getattr(cfg, "kv_role", None) == "kv_both":
+        return "kv_both"
     if backend in _BUDGET_KEYED_BACKENDS:
         wanted = _kv_role_for_budget(previous_budget, current_budget)
     else:
