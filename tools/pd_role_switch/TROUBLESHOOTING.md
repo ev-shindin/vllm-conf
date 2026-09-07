@@ -108,6 +108,18 @@ exactly what invalidates captured CUDA graphs.
 `VLLM_PD_KEEP_PREVIOUS=1` takes a strong reference before the rebuild. Without
 it, "the manager is cached" reuses nothing.
 
+## "Unknown vLLM environment variable detected: VLLM_PD_KEEP_PREVIOUS"
+
+Harmless, and it appears once per API server process, so a DP=16 run prints it
+sixteen times. vLLM warns about any `VLLM_*` variable missing from `vllm/envs.py`,
+and this one is deliberately not declared there — `pd_role_switch.py` reads it
+straight from `os.environ`, so the injection does not have to patch `envs.py`.
+
+Do not read the warning as "retention is off". Check the memory instead: with
+retention working, both buffers are resident (a few hundred MiB above the
+one-buffer figure) and the switch back onto the parked buffer allocates **0 MiB**.
+A rebuild would show neither.
+
 ## Every switch returns in a few ms with no ranks
 
 ```

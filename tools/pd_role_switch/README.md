@@ -377,6 +377,37 @@ absolute switch timings differ between the two clusters.
 Rows marked "projected" are derived from the two measured budget points, not
 observed directly.
 
+### Reproduction on 2026-09-07, EP=16, following these instructions
+
+Run through the documented path on a stock `v0.28.0` image (step 1b injection),
+2 x 8 H200 on kermit, nodes `gc37d06` + `g134dfa`:
+
+```
+                                this run     published
+switch, fresh build             1548 ms      1464-1587 ms     in range
+switch, reuse parked buffer      798 ms       378-387 ms      2.1x SLOWER
+switch under load               7227 ms      4279 ms          1.7x slower
+in-flight requests completed     24/24       24/24            matches
+GPU0 used, one buffer          126258 MiB   126257 MiB        within 1 MiB
+GPU0 used, both buffers        126544 MiB   126543 MiB        within 1 MiB
+retained buffer cost             286 MiB      286 MiB         exact
+reuse switch allocation            0 MiB        0 MiB         exact
+PASS 16/16 ranks, 75 layers rebuilt (both directions); output identical; rc=0
+```
+
+**The memory figures reproduce exactly and the latencies do not.** Retention is
+demonstrably working — both buffers resident at +286 MiB, and the return switch
+allocates 0 MiB, which is only possible when the parked buffer is reused. So the
+gap is not a disabled retain path.
+
+**The 378-387 ms headline did not reproduce, and this is unexplained.** Note the
+shape of it: the *fresh build* lands inside the published range while the
+*reuse* path is twice as slow. General slowness — fabric contention, a busier
+cluster, a different node pair — should move both. Candidates not yet separated:
+the published run used a different node pair, and the quiesce barrier's cost
+varies (it has previously been measured adding ~2 s per switch). Treat 378 ms as
+a best case on a quiet cluster rather than a figure any run will hit.
+
 The serving-performance and TTFT tables are EP=8 on kermit, single node, and are
 separate runs from the switch latencies above.
 
