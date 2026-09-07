@@ -78,9 +78,52 @@ seconds** from node-local disk — and about 1355 seconds when two replicas shar
 one network volume. The switch is roughly three orders of magnitude cheaper than
 the alternative it replaces.
 
-**Dual-role capability therefore costs at most 2.35% of a GPU.** That is the
-number to weigh against the capacity currently stranded on the wrong side of a
-fixed ratio.
+**In memory, dual-role capability costs at most 2.35% of a GPU.** Memory is not
+the only cost, however, and the other one is larger — see below.
+
+### The throughput cost: a switchable engine is a generalist
+
+A dedicated replica is free to run the expert-matrix kernel best suited to its
+one role. A switchable engine is not: the mechanism that lets both role buffers
+coexist is incompatible with that kernel, so the engine falls back to a
+general-purpose one that serves both roles rather than excelling at one.
+
+Measured on one 8 × H200 node per arm, GLM-5.2-FP8, expert parallelism 8.
+16 concurrent requests throughout; every prompt unique per request and per
+repeat; two warm-up passes discarded and four measured.
+
+| Engine | Decode work (mean, range) | Prefill work (mean, range) |
+|---|---|---|
+| Dedicated **decode** replica | **471.9** tok/s (465–481) | 29.9 tok/s (19–39) |
+| **Ours** in the decode role | 407.1 tok/s (405–409) | 19.7 tok/s (18–21) |
+| Dedicated **prefill** replica | 99.3 tok/s (98–100) | 38.5 tok/s (29–43) |
+| **Ours** in the prefill role | **417.3** tok/s (407–445) | 41.5 tok/s (15–59) |
+
+Two findings are solid — tight spreads, non-overlapping ranges:
+
+- **Against us: our decode engine is 13.7% slower at decode** than a replica
+  built only to decode (407 against 472 tok/s). For a decode-bound fleet that is
+  a genuine price, and it is separate from the 2.35% of memory.
+- **For us: a dedicated prefill replica collapses off its own role**, managing
+  just 99 tok/s of decode work. Ours does **4.2× better** in the same
+  configuration. Our engine turns in roughly 410 tok/s of decode in *either*
+  configuration — the specialists swing between 99 and 472.
+
+**The prefill column is not conclusive.** Every pair overlaps and one arm ranges
+from 15 to 59 tok/s. These runs use only 8 output tokens, so wall time is
+dominated by prompt processing and is correspondingly noisy. No claim about
+relative prefill throughput should be drawn from this table.
+
+So the trade is **13.7% of peak decode throughput** in exchange for never being
+the wrong kind of replica. A fleet whose traffic mix is stable should keep
+specialists and take the 13.7%. A fleet whose mix moves is today paying a 4.2×
+penalty whenever demand lands on the role a replica was not built for.
+
+*Method note: an earlier version of this section reported a 34% decode penalty
+and a prefill advantage. Both were artefacts — the first from comparing points
+on an unconverged warm-up curve, the second from re-sending an identical prompt,
+which the prefix cache served without doing the prefill work. The figures above
+come from the corrected harness, which fails loudly if prompts repeat.*
 
 ### Why it is affordable now and was not before
 
@@ -118,10 +161,11 @@ Being precise about this matters more than the headline.
   the wire), but not yet across a role change. This is the main open claim.
 - **Behaviour in the full llm-d platform**, with the real request router, rather
   than a test proxy.
-- **Whether our engine serves as fast as a dedicated one.** Our configuration
-  cannot use the same expert-matrix kernel that a standard replica uses, for a
-  technical reason unrelated to switching. A like-for-like comparison under load
-  is currently running.
+- ~~Whether our engine serves as fast as a dedicated one.~~ **Now measured:
+  13.7% less decode throughput than a dedicated decode replica, and 4.2× more
+  than a dedicated prefill replica.** See the throughput table above. Relative
+  *prefill* throughput remains unresolved — that workload was too noisy to
+  separate the arms.
 - Behaviour at expert parallelism 32; all figures above are at 16.
 
 ---
@@ -137,6 +181,12 @@ Being precise about this matters more than the headline.
 - **No extra hardware.** The capability costs a fraction of one GPU's memory and
   no additional GPUs.
 - **There is a named user asking for it.** The demand is not speculative.
+
+**Where it is the wrong answer.** A fleet whose traffic mix is stable should keep
+dedicated replicas and take the 13.7% of decode throughput that specialisation
+buys. This is worth adopting where the ratio *moves* — and it is worth measuring
+how far a given fleet's ratio actually drifts before committing to either
+answer.
 
 ---
 
