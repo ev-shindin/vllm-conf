@@ -76,6 +76,47 @@ on every decode; deepep_v2 keeps the graphs and does not.
 Token totals are derived from the request shape (16 x 256 with `ignore_eos`),
 not read back from the responses.
 
+### Serving performance against dedicated replicas
+
+The switch is cheap, but a switchable engine is not configured the way a
+dedicated one is, and that costs something in steady-state serving. It is
+measured here rather than assumed.
+
+`deepep_v2` pads its contiguous layout and `deep_gemm` derives the expert count
+from the padded tensor (`deep_gemm_utils.py:300`), so a switchable engine cannot
+use it and the oracle picks `FLASHINFER_CUTLASS`. A dedicated replica is free to
+take `DEEPGEMM` for prefill or `BATCHED_DEEPGEMM` for decode — the batched
+variant being tuned for the decode activation format.
+
+One 8 × H200 node per arm, GLM-5.2-FP8, EP=8, 16 concurrent, prompts unique per
+request and per repeat, two warm-up passes discarded, four measured.
+
+| Engine | MoE kernel | Decode throughput |
+| --- | --- | --- |
+| dedicated decode replica | `BATCHED_DEEPGEMM` | **471.9 tok/s** (465–481) |
+| ours, decode role | `FLASHINFER_CUTLASS` | 407.1 tok/s (405–409) |
+| dedicated prefill replica | `DEEPGEMM` | 99.3 tok/s (98–100) |
+| ours, prefill role | `FLASHINFER_CUTLASS` | **417.3 tok/s** (407–445) |
+
+**Decode costs 13.7%** against a dedicated decode replica. In exchange the
+engine never collapses off-role: a dedicated prefill replica manages 99 tok/s of
+decode work, ours 417 — **4.2×** — and ours holds ~410 tok/s in either
+configuration while the specialists swing between 99 and 472.
+
+Prefill belongs in latency, not output-token throughput. Time to the first
+streamed chunk carrying text, 1500-word prompts:
+
+| Prefill role | one request at a time | 16 concurrent | p90 at 16 |
+| --- | --- | --- | --- |
+| dedicated prefill replica | 533.6 ms (525–538) | **973.6 ms** | **1360 ms** |
+| ours | **364.8 ms** (360–369) | 1311.2 ms | 1915 ms |
+
+**This reverses with load.** Unloaded, ours reaches the first token 1.46×
+sooner; at 16 concurrent prompts it is 1.35× slower with a worse tail. The
+general-purpose kernel serves one sequence well; the batched kernel scales
+better across a batch. Ours is the faster engine for an interactive,
+low-concurrency prefill path and the slower one for a saturated prefill fleet.
+
 ### Why internode is the interesting case
 
 Under NVSHMEM the high-throughput and low-latency buffers cannot coexist —
@@ -99,6 +140,39 @@ cd /tmp && python3 -c "import deep_ep; print(hasattr(deep_ep, 'ElasticBuffer'))"
 
 The version pin is exact and deep_ep must be built against the same NCCL it
 runs on. Both matter; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+### 1b. Put this branch into a stock image
+
+Only needed if you are running the published `vllm/vllm-openai:v0.28.0` image
+rather than an environment built from this branch. It was previously left
+unstated, and there is no way to guess it correctly.
+
+**Do not copy the changed files in.** This branch is based on vLLM `main`, which
+has drifted past v0.28.0, so the nine MODIFIED files carry newer upstream code
+with them — `vllm/v1/engine/core.py` imports `resolve_kv_cache_layout`, which
+does not exist in v0.28.0, and every engine dies at init with an `ImportError`.
+
+Copy the four ADDED files whole, and PATCH the nine modified ones at their
+anchors:
+
+```bash
+BASE=$(git merge-base main HEAD)
+SP=$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')
+
+# 4 added files: self-contained, safe to copy
+git archive HEAD $(git diff --diff-filter=A --name-only $BASE..HEAD -- vllm/) | tar -x -C "$SP"
+
+# 9 modified files: apply as a patch, and refuse anything that does not apply
+git diff $BASE..HEAD -- $(git diff --diff-filter=M --name-only $BASE..HEAD -- vllm/) > /tmp/edits.patch
+( cd "$SP" && patch -p1 --forward --batch < /tmp/edits.patch )
+[ "$(find "$SP/vllm" -name '*.rej' | wc -l)" = "0" ] || { echo "patch did not apply cleanly"; exit 1; }
+
+python3 -c "import vllm.v1.engine.pd_role; print('pd_role OK')"
+```
+
+Verified against v0.28.0: 13 hunks, 0 rejects. Check `pd_role` imports before
+launching — without it `/switch_pd_role` does not exist and the test below will
+fail at the first switch rather than at startup.
 
 ### 2. Launch
 
@@ -131,6 +205,13 @@ curl -s -X POST localhost:8000/switch_pd_role \
 `ranks_switched` and `layers_switched` are the result to check. A switch that
 did nothing also returns quickly and still answers correctly, so timing and
 output alone will not tell you it worked.
+
+`/switch_pd_role` is a development route: it is attached by
+`register_vllm_dev_api_routers`, which the server calls only when
+**`VLLM_SERVER_DEV_MODE=1`** is set (`launchers/api_server/routers.py:34`). The
+script exports it. Launching without it gives an engine that serves normally
+while every switch returns `404` — which shows up as a 6 ms switch with no ranks
+rather than as a missing route.
 
 Set `VLLM_PD_KEEP_PREVIOUS=1` (the script does) to park the outgoing buffer.
 That is what keeps captured CUDA graphs valid and makes the return switch cost
@@ -169,6 +250,31 @@ That exercises the direction flip and shows NixlConnector tolerates a live
 `kv_role` change. It does not exercise an actual KV transfer between a prefill
 and a decode replica, which needs two engines and a disaggregated setup.
 
+### KV does move between two engines (measured separately)
+
+A 1P1D pair on stock v0.28.0, `NixlConnector`, upstream's
+`tests/v1/kv_connector/nixl_integration/toy_proxy_server.py`:
+
+```
+vllm:nixl_bytes_transferred_count        1
+vllm:nixl_bytes_transferred_sum          3670016      (3.5 MiB)
+vllm:nixl_xfer_time_seconds_sum          0.008462
+vllm:nixl_num_failed_transfers_total     0
+```
+
+Booked on the **decode** engine — the connector pulls, so the puller records the
+transfer and the prefiller reading zero is correct, not a miss.
+
+**Assert on bytes, never on output.** A decode engine that receives no KV
+silently recomputes the prefix and answers correctly, so an output-equality
+check passes a completely broken transfer. Match the metric name up to `{`: a
+bare prefix match also catches Prometheus's `_created` series, whose value is an
+epoch timestamp, which once reported `failed=1788776689` for zero real failures.
+
+Still open: this pair had not switched roles. A transfer **across** a role
+change, with the direction reversed, is the one claim on this branch that
+hardware has not yet answered.
+
 ## Requirements
 
 - 8 GPUs per node; InfiniBand with GIN (GPU-Initiated Networking) for multi-node
@@ -190,3 +296,27 @@ absolute switch timings differ between the two clusters.
 
 Rows marked "projected" are derived from the two measured budget points, not
 observed directly.
+
+The serving-performance and TTFT tables are EP=8 on kermit, single node, and are
+separate runs from the switch latencies above.
+
+### Three ways these benchmarks lied, all of which looked like clean results
+
+Anyone re-running this will meet them, so they are named rather than fixed
+silently:
+
+- **An unconverged warm-up curve.** Decode throughput climbs for several passes
+  before flattening (444 → 607 → 641 tok/s on one arm). Comparing two arms at
+  different points on that curve produced a 34% gap where the settled figure is
+  13.7%. Discard warm-up passes and check the trend has flattened.
+- **The prefix cache.** Re-sending one identical long prompt makes every pass
+  after the first a cache hit — 16 × 1800 tokens "prefilled" in 298 ms, which is
+  not physically possible. Prompts must be unique per request *and* per repeat.
+- **TTFT taken from the HTTP response headers.** vLLM returns `200` and headers
+  immediately on a streaming request, so `curl -w %{time_starttransfer}` reports
+  ~4 ms for a 2000-token prefill. Parse the stream and take the first chunk that
+  actually carries text. A plausibility floor is worth keeping: a sub-30 ms TTFT
+  on a prompt this size is a broken measurement, not a fast engine.
+
+A related tell: if mean, p50, p90 and max come back identical, the samples have
+collapsed to n=1 — check the harness before believing the number.

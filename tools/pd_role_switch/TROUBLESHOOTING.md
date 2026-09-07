@@ -108,6 +108,32 @@ exactly what invalidates captured CUDA graphs.
 `VLLM_PD_KEEP_PREVIOUS=1` takes a strong reference before the rebuild. Without
 it, "the manager is cached" reuses nothing.
 
+## Every switch returns in a few ms with no ranks
+
+```
+### -> decode(128): / in 6 ms
+FAIL  ranks=0/8 layers=0 -- the switch did nothing
+```
+
+The engine boots, serves correct answers, and every switch is instant. In the
+engine log:
+
+```
+INFO: "POST /switch_pd_role HTTP/1.1" 404 Not Found
+```
+
+`/switch_pd_role` is attached by `register_vllm_dev_api_routers`, which the
+server calls **only when `VLLM_SERVER_DEV_MODE=1`**
+(`vllm/entrypoints/launchers/api_server/routers.py:34`). Without it the route
+does not exist. `run_switch_test.sh` exports it; a hand-rolled launch must too.
+
+Note what this looks like if you only watch timing and output: a very fast
+switch on an engine that still answers perfectly. It is the reason the harness
+checks `ranks_switched` and `layers_switched` and fails on zero.
+
+Importing `vllm.v1.engine.pd_role` successfully does **not** mean the route is
+served — the module can be present while the router is never attached.
+
 ## Diagnosing on Kubernetes
 
 - A crash presents as a hang. The wrapper shell outlives the engine, so the pod

@@ -32,6 +32,11 @@ EP=$(( NODES * GPUS_PER_NODE ))
 # TROUBLESHOOTING.md explains both failures.
 if [ "$NODES" -gt 1 ]; then HYBRID=${HYBRID:-0}; else HYBRID=${HYBRID:-1}; fi
 export VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=$HYBRID
+# /switch_pd_role is attached by register_vllm_dev_api_routers, which the server
+# only calls when this is set (entrypoints/launchers/api_server/routers.py:34).
+# Without it the engine serves normally and every switch returns 404 -- which
+# reads as a 6 ms switch with no ranks, not as a missing route.
+export VLLM_SERVER_DEV_MODE=1
 # deep_gemm is forced from two places; the flag is omitted below and this is
 # the other one. deepep_v2 pads its layout and deep_gemm rejects the padding.
 export VLLM_USE_DEEP_GEMM=0
@@ -114,7 +119,14 @@ ask () {
     | grep -o '"text":"[^"]*"' | head -1
 }
 ok_ranks () {  # $1 = response; echoes "ranks/layers"
-  echo "$(echo "$1" | grep -o '"ranks_switched":[0-9]*' | grep -o '[0-9]*')/$(echo "$1" | grep -o '"layers_switched":[0-9]*' | grep -o '[0-9]*')"
+  # A data-parallel response carries layers_switched once PER RANK, so an
+  # unbounded grep returns "75\n75\n..." -- which then fails the integer test in
+  # the verdict and reports a perfectly good 8/75 switch as FAIL. Take the first
+  # of each so the verdict compares numbers rather than a multi-line string.
+  local r l
+  r=$(printf '%s' "$1" | grep -o '"ranks_switched":[0-9]*' | grep -o '[0-9]*' | head -1)
+  l=$(printf '%s' "$1" | grep -o '"layers_switched":[0-9]*' | grep -o '[0-9]*' | head -1)
+  printf '%s/%s' "${r:-0}" "${l:-0}"
 }
 
 A0=$(ask)
@@ -155,16 +167,30 @@ fi
 R1RL=$(ok_ranks "$R1"); R2RL=$(ok_ranks "$R2")
 echo
 echo "############ RESULT ############"
-printf '%-34s %-16s %s\n' "measurement" "this run" "published (2x8 H200, EP=16)"
-printf '%-34s %-16s %s\n' "switch, fresh build" "${MS_BUILD} ms" "1464-1587 ms"
-printf '%-34s %-16s %s\n' "switch, reuse parked buffer" "${MS_REUSE} ms" "378-387 ms"
+# The published figures are EP=16 across two nodes. Comparing a single-node
+# EP=8 run against them invites the wrong conclusion, so say which column you
+# are being shown and only claim a reproduction when the topology matches.
+if [ "$NODES" -gt 1 ]; then
+  REF="published (2x8 H200, EP=16)"
+  REF_BUILD="1464-1587 ms"; REF_REUSE="378-387 ms"; REF_LOAD="4279 ms"
+  REF_ONE="126257 MiB"; REF_BOTH="126543 MiB"; REF_RETAIN="286 MiB (at 128 tokens)"
+else
+  REF="published (1x8 H200, EP=8)"
+  REF_BUILD="n/a"; REF_REUSE="277-656 ms"; REF_LOAD="n/a"
+  REF_ONE="n/a"; REF_BOTH="n/a"; REF_RETAIN="234 MiB (at 128 tokens)"
+  echo "### NOTE: single node. The headline 378 ms figure is EP=16 on two nodes;"
+  echo "### this column is the intranode EP=8 reference instead."
+fi
+printf '%-34s %-16s %s\n' "measurement" "this run" "$REF"
+printf '%-34s %-16s %s\n' "switch, fresh build" "${MS_BUILD} ms" "$REF_BUILD"
+printf '%-34s %-16s %s\n' "switch, reuse parked buffer" "${MS_REUSE} ms" "$REF_REUSE"
 [ "$LOAD" != "0" ] && \
-printf '%-34s %-16s %s\n' "switch under load" "${MS_LOAD} ms" "4279 ms"
+printf '%-34s %-16s %s\n' "switch under load" "${MS_LOAD} ms" "$REF_LOAD"
 [ "$LOAD" != "0" ] && \
 printf '%-34s %-16s %s\n' "in-flight requests completed" "${OKN}/${LOAD}" "24/24, 0 failed"
-printf '%-34s %-16s %s\n' "GPU0 used, one buffer" "${MEM_BOOT} MiB" "126257 MiB"
-printf '%-34s %-16s %s\n' "GPU0 used, both buffers" "${MEM_BOTH} MiB" "126543 MiB"
-printf '%-34s %-16s %s\n' "retained buffer cost" "$(( MEM_BOTH - MEM_BOOT )) MiB" "286 MiB (at 128 tokens)"
+printf '%-34s %-16s %s\n' "GPU0 used, one buffer" "${MEM_BOOT} MiB" "$REF_ONE"
+printf '%-34s %-16s %s\n' "GPU0 used, both buffers" "${MEM_BOTH} MiB" "$REF_BOTH"
+printf '%-34s %-16s %s\n' "retained buffer cost" "$(( MEM_BOTH - MEM_BOOT )) MiB" "$REF_RETAIN"
 printf '%-34s %-16s %s\n' "reuse switch allocation" "$(( MEM_BACK - MEM_BOTH )) MiB" "0 MiB"
 echo
 # ranks/layers is the verdict: a no-op switch also returns fast and answers
