@@ -371,9 +371,11 @@ change. Relabelling a pod therefore does not move it between roles — it remove
 it from its owner, which promptly replaces it with a cold one. A switchable
 deployment has to keep the role out of every selector.
 
-[WELL-LIT-PATH-LLM-D.md](WELL-LIT-PATH-LLM-D.md) has the deployment shape that
-works (one Deployment, role as a mutable pod label), a full GLM-5.2 manifest,
-and the four-step handover.
+The deployment shape that works — one Deployment, role as a mutable pod label,
+a full GLM-5.2 manifest and the four-step handover — is a guide in the
+autoscaler repository: **docs/guides/pd-role-switch/**. See
+[WELL-LIT-PATH-LLM-D.md](WELL-LIT-PATH-LLM-D.md) for the pointer and what it
+covers.
 
 **Status: the engine half is built and measured. The controller half is not.**
 That is the gap between "one engine can change role in 378 ms" and "a fleet can
