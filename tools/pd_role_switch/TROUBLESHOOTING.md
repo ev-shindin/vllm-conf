@@ -7,33 +7,46 @@ run does not reproduce the numbers in [README.md](README.md), start here.
 
 | symptom | cause | fix |
 | --- | --- | --- |
-| `Segfault encountered`, Python-only frames, during startup | NCCL newer than 2.30 | pin `nvidia-nccl-cu12==2.30.7` |
-| `cudaErrorIllegalAddress` in `csrc/elastic/buffer.hpp` | deep_ep built against a different NCCL than it runs on | rebuild deep_ep against the pinned version |
+| `Segfault encountered`, Python-only frames, during startup | vLLM's `ncclCommProperties` mirror older than the NCCL runtime | fixed upstream by the version clamp; on an older vLLM, pin NCCL to the mirror's layout |
+| `cudaErrorIllegalAddress` in `csrc/elastic/buffer.hpp` | deep_ep built against a different NCCL than it runs on | rebuild deep_ep against the installed NCCL |
+| `missing link library: ... nccl=none`, on an image that has one | `nvidia` is a namespace package, so `nvidia.__file__` is `None` | use `nvidia.__path__`; fixed in `build_deep_ep.sh` |
+| ptxas `Feature 'elect' requires .target sm_90 or higher` | built for the image's whole `TORCH_CUDA_ARCH_LIST` | DeepEP is sm_90-only; set `DEEP_EP_ARCH` |
 | `ZeroDivisionError` at `deep_ep/buffers/elastic.py:809` | hybrid mode enabled on 2+ nodes | `VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=0` |
 | illegal address in `launch_engram_fetch` | hybrid mode disabled on a single node | `VLLM_DEEPEP_V2_ALLOW_HYBRID_MODE=1` |
 | `assert expert_start_loc.shape[0] == num_experts` | deep_gemm still selected | `VLLM_USE_DEEP_GEMM=0` **and** drop `--moe-backend` |
 | `ranks_switched: 0` with a fast, correct-looking response | the switch was a no-op | check the requested budget differs from the current one |
 | engine appears hung, pod still `Running` | the workers died; the wrapper outlives them | grep `hit an exception`, `Engine core initialization failed` |
 
-## The NCCL pin has to be exact
+## NCCL needs no pin; the CUDA major does need checking
 
-`>=2.30.4` resolves to the newest wheel. 2.31.2 segfaults inside
-`ncclCommQueryProperties`.
+`vllm/distributed/device_communicators/pynccl_wrapper.py` mirrors NCCL's
+`ncclCommProperties` as a ctypes `Structure`. The struct appears in **no public
+`nccl.h`** — only the symbol is exported from `libnccl.so` — so it is mirrored
+from NCCL's internal headers and changes between minor versions with no public
+API change. (`nccl.h` grew from 844 to 972 lines between 2.30.7 and 2.31.2.)
 
-`vllm/distributed/device_communicators/pynccl_wrapper.py` hand-mirrors NCCL's
-`ncclCommProperties` as a ctypes `Structure`, and its own comment says
-"NCCL 2.30+". The struct appears in **no public `nccl.h`** — only the symbol is
-exported from `libnccl.so` — so it is mirrored from NCCL's internal headers and
-is free to change between minor versions with no public API change.
-(`nccl.h` grew from 844 to 972 lines between 2.30.7 and 2.31.2.)
+`ncclCommQueryProperties` fills the fields gated by the version the **caller**
+declares in `props.version`, not by `props.size`. A mirror written for one
+layout, told the runtime is newer, is therefore written past its end — memory
+corruption rather than a clean API error, and nondeterministic with it: in one
+run 3 of 8 ranks returned from the call normally and the other 5 died.
 
-The failure is memory corruption, not a clean API error, so it is
-nondeterministic: in one run 3 of 8 ranks returned from the call normally and
-the other 5 died. A single clean boot does not clear this.
+The mirror now carries the v2.31.2 layout and clamps what it declares:
 
-`has_deep_ep_v2()` accepts any NCCL `>= 2.30.4` against that fixed mirror, so
-newer releases will keep being accepted. A defensive upper bound would turn the
-segfault into a clean "deepep_v2 unavailable".
+```python
+props.version = min(nccl.ncclGetRawVersion(), NCCL_COMM_PROPERTIES_LAYOUT_VERSION)
+```
+
+so the runtime fills only fields the mirror has, in either direction, and no
+particular NCCL version is required. To use fields from a newer NCCL, extend the
+layout and bump the constant.
+
+The CUDA major still has to be right. Both `vllm/vllm-openai:v0.28.0` and the
+nightly named in [README.md](README.md) are CUDA 13 and carry
+`nvidia-nccl-cu13` 2.30.7, so installing an `nvidia-nccl-cu12` wheel puts a
+second NCCL beside the first instead of replacing it, and leaves the
+`libnccl.so.2` search to pick between them. `build_deep_ep.sh` reads which wheel
+is installed rather than naming one.
 
 ## deep_ep must match its NCCL
 

@@ -148,7 +148,7 @@ the graphs survive, and a switch becomes a buffer swap rather than a teardown.
 
 ## Running it
 
-### 1. Build deep_ep against a pinned NCCL
+### 1. Build deep_ep against the NCCL in the image
 
 ```bash
 tools/pd_role_switch/build_deep_ep.sh
@@ -156,8 +156,22 @@ pip install --no-deps --force-reinstall dist/deep_ep-*.whl
 cd /tmp && python3 -c "import deep_ep; print(hasattr(deep_ep, 'ElasticBuffer'))"
 ```
 
-The version pin is exact and deep_ep must be built against the same NCCL it
-runs on. Both matter; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+deep_ep's compiled `_C` tracks the NCCL it was built against, so it has to be
+built against the one it will run on. The script reads which `nvidia-nccl-cu1x`
+wheel is installed rather than naming a version or a CUDA major: the images
+below are CUDA 13 and carry `nvidia-nccl-cu13` 2.30.7, and installing a `cu12`
+wheel would add a second NCCL beside it instead of replacing it.
+
+It builds for sm_90 only. Set `DEEP_EP_ARCH` for a different target, and note
+that `TORCH_CUDA_ARCH_LIST` is not the knob -- the images already export it with
+seven architectures, and DeepEP's kernels are sm_90-only, so building for that
+list fails in ptxas with `Feature 'elect' requires .target sm_90 or higher`.
+
+No GPU is needed. On both images below this takes about 80s on 12 cores and
+leaves a wheel in `dist/`. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+`SRC_REF` selects the DeepEP revision and defaults to `main`, which moves: pin
+it if you need to reproduce the same deep_ep twice.
 
 ### 1b. Put this branch into a stock image
 
@@ -185,6 +199,13 @@ Release images do not work at the time of writing: `v0.29.0` was cut from
 `v0.28.0` specifically there is the tag `pd-role-switch-v0.28.0` -- this work as
 it stood before the branch moved onto newer upstream, and where every
 measurement below was taken.
+
+**Take only the injection from that tag, and step 1 from this branch.** The
+tag's own copy of `build_deep_ep.sh` names `nvidia-nccl-cu12` and reads
+`nvidia.__file__`, and `vllm/vllm-openai:v0.28.0` is CUDA 13 with `nvidia` as a
+namespace package exactly like the nightly, so that copy stops at `missing link
+library: ... nccl=none` before compiling anything. The script in step 1 above
+runs unchanged on both images.
 
 **Do not copy the changed files in.** The nine MODIFIED files carry upstream
 code with them, newer than any image whose vLLM predates this branch's base, and

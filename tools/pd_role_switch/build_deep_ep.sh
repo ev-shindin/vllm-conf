@@ -2,37 +2,79 @@
 # Build deep_ep against a pinned NCCL, for deepep_v2 role switching.
 #
 # Why a rebuild at all: deep_ep's compiled _C tracks the NCCL it was built
-# against. The shipped 2.0.0+local in vllm/vllm-openai:v0.28.0 was built against
-# NCCL 2.29.7, and running it on a newer runtime gives cudaErrorIllegalAddress
-# inside csrc/elastic/buffer.hpp during the first MoE forward.
+# against, and running it against a different runtime gives
+# cudaErrorIllegalAddress inside csrc/elastic/buffer.hpp during the first MoE
+# forward. The rule is therefore to build against whatever NCCL is installed,
+# which is what this does.
 #
-# Why the pin is exact: vLLM hand-mirrors NCCL's ncclCommProperties struct from
-# INTERNAL headers -- the symbol is exported from libnccl but the struct is in no
-# public nccl.h -- and the mirror is written for the 2.30 layout. ">=2.30.4"
-# resolves to the newest wheel, and 2.31.2 corrupts memory in
-# ncclCommQueryProperties. The failure is nondeterministic (3 of 8 ranks survived
-# it in one run), so a single clean boot does not clear it.
+# It does not force a version. vLLM mirrors NCCL's ncclCommProperties struct --
+# the symbol is exported from libnccl but the struct is in no public nccl.h --
+# and pynccl_wrapper.py now carries the v2.31.2 layout and clamps the version it
+# declares to NCCL_COMM_PROPERTIES_LAYOUT_VERSION. NCCL fills fields gated by
+# the version the caller declares rather than by props.size, so the clamp is
+# what keeps the runtime from writing past the mirror, and no particular NCCL is
+# required on that path any more.
+#
+# The CUDA major is read, never assumed. vllm/vllm-openai nightlies are CUDA 13
+# and carry nvidia-nccl-cu13, so installing an nvidia-nccl-cu12 wheel would put a
+# second NCCL of a different major beside the first rather than replacing it,
+# leaving the libnccl.so.2 search below to choose between them arbitrarily.
 #
 # No GPU is needed: nvcc compiles for the arch it is told about.
 set -uo pipefail
 
-NCCL_VERSION=${NCCL_VERSION:-2.30.7}
-ARCH=${TORCH_CUDA_ARCH_LIST:-9.0}     # 9.0 = H100/H200 (sm_90)
+NCCL_VERSION=${NCCL_VERSION:-}         # empty: build against what is installed
+# 9.0 = H100/H200 (sm_90). Deliberately NOT read from TORCH_CUDA_ARCH_LIST,
+# which is the variable this exports below: the vllm-openai images already set
+# it to every arch they ship for, so reading it back defaulted to nothing and
+# the build compiled DeepEP for sm_75 through sm_120. DeepEP's kernels are
+# sm_90-only -- elect, mbarrier, cp.async.bulk -- and ptxas rejects the older
+# targets outright ("Feature 'elect' requires .target sm_90 or higher").
+ARCH=${DEEP_EP_ARCH:-9.0}
 OUT=${OUT:-./dist}
 mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)   # absolutise: the build runs from a temp dir
 SRC_REF=${SRC_REF:-main}
 
-echo "### building deep_ep against NCCL ${NCCL_VERSION} for sm_${ARCH}"
 python3 -c "import importlib.metadata as m; print('### deep_ep before:', m.version('deep_ep'))" 2>/dev/null
 
-pip install -q --no-cache-dir "nvidia-nccl-cu12==${NCCL_VERSION}" || {
-  echo "### could not install nvidia-nccl-cu12==${NCCL_VERSION}"; exit 1; }
-# Print the version actually installed. Never report a pin as applied without
-# reading it back -- a hardcoded "installed X" line in an earlier version of
-# this script claimed the wrong version while the build used another.
-python3 -c "import importlib.metadata as m; print('### nccl now:', m.version('nvidia-nccl-cu12'))" || exit 1
+# Which NCCL wheel is installed, and for which CUDA major.
+NCCL_PKG=$(python3 - <<'PYEOF'
+import importlib.metadata as m
+for p in ("nvidia-nccl-cu13", "nvidia-nccl-cu12"):
+    try:
+        m.version(p)
+        print(p)
+        break
+    except Exception:
+        pass
+PYEOF
+)
+if [ -z "$NCCL_PKG" ]; then
+  echo "### no nvidia-nccl-cu1x wheel installed: nothing to build against"; exit 1
+fi
 
-NV=$(python3 -c "import os,nvidia; print(os.path.dirname(nvidia.__file__))" 2>/dev/null)
+# Only when the caller asks for a specific version, and then of the major that
+# is already there -- mixing majors is the failure this guards against.
+if [ -n "$NCCL_VERSION" ]; then
+  pip install -q --no-cache-dir "${NCCL_PKG}==${NCCL_VERSION}" || {
+    echo "### could not install ${NCCL_PKG}==${NCCL_VERSION}"; exit 1; }
+fi
+
+# Read the version back rather than echoing one. An earlier revision printed a
+# hardcoded line naming a version the build did not use.
+NCCL_NOW=$(python3 -c "import importlib.metadata as m; print(m.version('${NCCL_PKG}'))") || exit 1
+echo "### building deep_ep against ${NCCL_PKG} ${NCCL_NOW} for sm_${ARCH}"
+
+# nvidia is a NAMESPACE package in the CUDA 13 images, so its __file__ is None
+# and os.path.dirname(__file__) raises -- with the error swallowed, leaving an
+# empty path that finds no libnccl and aborts below with "missing link library"
+# on an image that has one. __path__ is what carries the directories, and a
+# namespace package may name more than one.
+readarray -t NV_DIRS < <(python3 -c "import nvidia; print('\n'.join(nvidia.__path__))" 2>/dev/null)
+if [ ${#NV_DIRS[@]} -eq 0 ]; then
+  echo "### could not locate the nvidia package directories"; exit 1
+fi
+echo "### nvidia package dirs: ${NV_DIRS[*]}"
 TK=${CUDA_HOME:-/usr/local/cuda}/targets/x86_64-linux/include
 
 # Some CUDA images ship an incomplete include tree (nvrtc.h and cusparse.h are
@@ -41,7 +83,7 @@ TK=${CUDA_HOME:-/usr/local/cuda}/targets/x86_64-linux/include
 # breaks nvcc's generated stub with a __cudaLaunch arity error.
 GAP=$(mktemp -d)
 n=0
-for d in $(find "$NV" -maxdepth 3 -type d -name include 2>/dev/null); do
+for d in $(find "${NV_DIRS[@]}" -maxdepth 3 -type d -name include 2>/dev/null); do
   ( cd "$d" || exit 0
     for f in $(find . -name "*.h" -o -name "*.hpp" 2>/dev/null); do
       rel=${f#./}
@@ -59,7 +101,7 @@ export C_INCLUDE_PATH="$GAP:${C_INCLUDE_PATH:-}"
 # libcuda is the DRIVER library and is absent on a build-only machine; the
 # toolkit ships a stub for exactly this. libnccl.so.2 comes from the wheel.
 STUB=$(find ${CUDA_HOME:-/usr/local/cuda}*/targets/*/lib/stubs -name "libcuda.so*" 2>/dev/null | head -1)
-NCCL_LIB=$(find "$NV" -name "libnccl.so.2" 2>/dev/null | head -1)
+NCCL_LIB=$(find "${NV_DIRS[@]}" -name "libnccl.so.2" 2>/dev/null | head -1)
 if [ -z "$STUB" ] || [ -z "$NCCL_LIB" ]; then
   echo "### missing link library: stub=${STUB:-none} nccl=${NCCL_LIB:-none}"; exit 1
 fi
