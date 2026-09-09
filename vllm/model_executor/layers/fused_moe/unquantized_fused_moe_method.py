@@ -202,10 +202,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
 
         self.unquantized_backend = backend
         self.experts_cls = experts_cls
-        # Rebuild through the shared path rather than repeating it. Its
-        # quant-config recompute reads only the layer's bias tensors and SwiGLU
-        # gate params, none of which a role switch touches, so it lands on an
-        # equivalent config.
+        # _init_moe_kernel already builds the kernel from the weights resident
+        # on the device. Its quant-config recompute reads only the layer's bias
+        # tensors and SwiGLU gate params, neither of which a backend re-selection
+        # touches, so it lands on an equivalent config.
         self._init_moe_kernel(layer)
 
     def _init_moe_kernel(self, layer: "RoutedExperts") -> None:
