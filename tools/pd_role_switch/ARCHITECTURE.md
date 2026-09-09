@@ -58,6 +58,27 @@ The engine keeps **both** role buffers resident at the same time. Switching is
 then a swap between two things already in memory rather than a teardown and
 rebuild — which is what makes it take milliseconds and allocate nothing.
 
+### What was built, and where
+
+![The call path, what a switch changes, and why there are two paths](img/solution.png)
+
+Four pieces, each small except the switch itself. An HTTP call arrives on a
+route that only exists in development mode; it is validated, then fanned out to
+**every** engine core rather than the first one, because under data parallelism
+each core holds its own copy of the MoE layers and all of them must change
+together. Each core then quiesces, changes three settings, and resumes.
+
+**Why the switch has two paths** is a question about vLLM rather than about this
+design. In the older expert-parallel backends a role *is* a backend: prefill and
+decode are `deepep_high_throughput` and `deepep_low_latency`, two separate
+implementations holding two separate buffers, and switching means moving the
+layers from one to the other — which is only safe if both read weights in the
+same layout, so the switch has to check. In the newer `deepep_v2` a single
+buffer serves both roles and the backend never changes; what changes is the
+token budget the buffer is sized for. The second is what these measurements use
+and it supersedes the first, but the first remains a supported configuration
+upstream, so both paths are maintained.
+
 ---
 
 ## 3. What it costs
