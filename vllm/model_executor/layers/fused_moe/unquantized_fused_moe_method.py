@@ -170,6 +170,44 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 assert self.moe_kernel is not None
                 self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
+    def rebuild_moe_kernel(
+        self, layer: "RoutedExperts", dry_run: bool = False
+    ) -> None:
+        """Re-select the experts class and rebuild the kernel around it.
+
+        Deliberately does NOT call ``convert_to_unquantized_kernel_format``:
+        TRITON and BATCHED_TRITON both fall through it unchanged, so the
+        weights on the device already suit either. Only that pair is allowed --
+        the FlashInfer and AITER backends do reshape weights at load time, and
+        swapping into one of those without reconverting would run the right
+        bytes through the wrong kernel.
+        """
+        backend, experts_cls = select_unquantized_moe_backend(moe_config=self.moe)
+        switchable = {
+            UnquantizedMoeBackend.TRITON,
+            UnquantizedMoeBackend.BATCHED_TRITON,
+        }
+        if backend != self.unquantized_backend and not {
+            backend,
+            self.unquantized_backend,
+        } <= switchable:
+            raise ValueError(
+                f"Cannot switch unquantized MoE backend "
+                f"{self.unquantized_backend.value} -> {backend.value} in "
+                f"place: they do not share a weight layout."
+            )
+
+        if dry_run:
+            return
+
+        self.unquantized_backend = backend
+        self.experts_cls = experts_cls
+        # _init_moe_kernel already builds the kernel from the weights resident
+        # on the device. Its quant-config recompute reads only the layer's bias
+        # tensors and SwiGLU gate params, neither of which a backend re-selection
+        # touches, so it lands on an equivalent config.
+        self._init_moe_kernel(layer)
+
     def _init_moe_kernel(self, layer: "RoutedExperts") -> None:
         """Build the MoE kernel from the layer's current (shuffled) weights."""
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
