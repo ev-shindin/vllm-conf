@@ -215,7 +215,59 @@ Being precise about this matters more than the headline.
 
 ---
 
-## 5. Why this matters commercially
+## 5. Where this meets upstream
+
+This is a fork of vLLM, so the question that decides what it costs to own is
+whether vLLM is moving toward it or away from it. Since the version it was built
+on, upstream has moved toward it in three specific ways.
+
+**It built the same primitive, for an unrelated reason.** vLLM's "Fast Start"
+(#54921, September 2026) added a loader that hands an engine its weights over
+IPC from a cache. To use weights that arrive already prepared, it needed a way
+to build the MoE kernel around what is already resident on the device without
+re-running the load-time conversion — so it added `_init_moe_kernel`, described
+in its own docstring as "build the MoE kernel from the layer's current
+(shuffled) weights".
+
+That is precisely the primitive a role switch needs, reached independently for a
+feature that has nothing to do with prefill and decode. Two features converging
+on the same seam is the strongest evidence available that the seam is real,
+rather than a special case argued for our benefit. It also shrinks what we have
+to propose: this work now re-selects the backend and calls upstream's helper
+instead of carrying its own copy of that logic, so what remains distinctly ours
+is the part that decides whether a given backend change is safe at all — which
+is the part worth reviewing.
+
+**It removed a deployment constraint.** Running this used to require an exact
+NCCL version. vLLM mirrors an NCCL structure that appears in no public header,
+and declaring a version newer than the mirror held wrote past its end — memory
+corruption rather than a clean error, and nondeterministic, so a clean start
+proved nothing. Upstream now carries the current layout and clamps the version
+it declares, so no particular NCCL is needed. That is one fewer thing an
+operator has to pin, and one fewer way a deployment fails confusingly.
+
+**It absorbed the rest at no cost.** A new load-time refinement of FP8 block
+shapes composes with the switch untouched, because the switch re-selects using
+the same key that refinement writes. Five new FP8 backends appeared; the guard
+that decides whether two backends share a weight layout is an allow-list, so
+each new one is refused rather than silently run over weights in the wrong
+layout. Choosing fail-closed earlier is why that needed no work now.
+
+**What follows from this.** The upstream contribution is four changes, and the
+largest has just become smaller and easier to argue. Ownership is cheaper as
+well: the switch is now measured against current vLLM as well as the version it
+was built on, so drift is something observed on a schedule rather than
+discovered during an incident.
+
+**The honest caveat.** Convergence brings churn. Upstream is actively changing
+the same files, and three of the four proposed changes already conflict with
+current vLLM — in the shared MoE and engine files, not in anything unique to
+this work. They rebase rather than redesign, but they have to be rebased shortly
+before they are proposed, not months earlier.
+
+---
+
+## 6. Why this matters commercially
 
 **One qualifier first, because it gates everything below.** What is built is the
 engine mechanism -- a replica can be told to change role and does so in under a second.
