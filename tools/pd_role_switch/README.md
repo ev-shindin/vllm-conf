@@ -164,13 +164,27 @@ runs on. Both matter; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 Only needed if you are running a published image rather than an environment
 built from this branch.
 
-**Pick a base image built from vLLM `main` on 2026-09-04 or later.** The
-injection patches nine existing files at their anchors, and one of those anchors
-is `_init_moe_kernel`, which vLLM gained that day in "Fast Start" (#54921). On
-an older base that hunk rejects. `vllm/vllm-openai:v0.28.0` is such a base: for
-that image use the tag `pd-role-switch-v0.28.0`, which is this work as it stood
-before the branch moved on to newer upstream, and which every measurement below
-was taken on.
+**Use a base image whose vLLM contains "Fast Start" (#54921, 2026-09-04).**
+The injection patches nine existing files at their anchors, and one of those
+anchors is `_init_moe_kernel`, which vLLM gained in that commit. On an older
+base the hunk rejects.
+
+The nightlies are tagged by the exact commit they were built from, which is what
+makes one verifiable as a base:
+
+```
+vllm/vllm-openai:nightly-385dce36bcee42309924a5ece951a96db3dce7f2
+```
+
+That commit sits two behind this branch's merge base, and both are in the
+mooncake connector and its tests -- none of the thirteen files here. The
+injection applies to it at 13 hunks, 0 rejects, no offsets.
+
+Release images do not work at the time of writing: `v0.29.0` was cut from
+`98dff2a81` on 2026-09-08 and still predates Fast Start, as does `v0.28.0`. For
+`v0.28.0` specifically there is the tag `pd-role-switch-v0.28.0` -- this work as
+it stood before the branch moved onto newer upstream, and where every
+measurement below was taken.
 
 **Do not copy the changed files in.** The nine MODIFIED files carry upstream
 code with them, newer than any image whose vLLM predates this branch's base, and
