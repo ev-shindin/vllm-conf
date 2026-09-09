@@ -23,10 +23,42 @@ Measured on 2 x 8 H200 (139.8 GiB), GLM-5.2-FP8, EP=16, vLLM v0.28.0,
 **24 of 24 in-flight requests completed, 0 failed**, and output was identical
 before and after every round trip.
 
-Intranode (EP=8, one node) switches in **277–629 ms**.
-
 Repeatability: 2 of 2 extra cycles switched all 16 ranks in both directions
 with matching output.
+
+### Intranode (EP=8, one node)
+
+One node, 8 x H200, same model and settings, measured on both engine/image
+pairs with a byte-identical `run_switch_test.sh`. Each pair completes 24 of 24
+in-flight requests, produces identical output across the round trip, and
+rebuilds 8/8 ranks across all 75 MoE layers in both directions.
+
+| | `v0.28.0` + tag `pd-role-switch-v0.28.0` | nightly `385dce36b` + this branch |
+| --- | --- | --- |
+| switch, fresh build | 4064 ms | 3895 ms |
+| switch, reuse parked buffer | **661 ms** | **50 ms** |
+| switch under load (24 in flight) | 6234 ms | 5680 ms |
+| retained buffer cost | 234 MiB | 232 MiB |
+| reuse switch allocation | 0 MiB | 0 MiB |
+| GPU0 used at boot | 129454 MiB | 126380 MiB |
+
+The reuse switch is roughly 13x faster on the newer base. It reproduced across
+two runs on different nodes (49 ms and 50 ms), and the test script was
+byte-identical between the two pairs, so this is a difference between engines
+rather than between measurements.
+
+**Why is not established.** It lies somewhere in the ~580 upstream commits
+between the two bases, or in this branch rebuilding the kernel through
+upstream's `_init_moe_kernel` rather than its own copy of that code. It has not
+been bisected, and until it is, the 277–656 ms range remains the right
+expectation for `v0.28.0`.
+
+What rules out the obvious artifact is that the switch is still doing the work.
+A switch that had degenerated into a no-op fails the ranks/layers check, and one
+that had stopped reusing the parked buffer shows a non-zero reuse allocation;
+here both directions rebuild 8/8 ranks across 75 layers, output is identical
+across the round trip, the retained buffer is unchanged at ~233 MiB, and the
+reuse switch still allocates 0 MiB.
 
 ### `VLLM_PD_PAUSE_MODE` decides the cost of switching under load
 

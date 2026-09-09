@@ -79,6 +79,14 @@ seconds** from node-local disk — and about 1355 seconds when two replicas shar
 one network volume. The switch is roughly three orders of magnitude cheaper than
 the alternative it replaces.
 
+The table above is vLLM v0.28.0 at expert parallelism 16. On a vLLM about 580
+commits newer, single node at expert parallelism 8, the switch is **faster**:
+onto a buffer held from before it takes **50 ms**, against 661 ms measured the
+same way on v0.28.0 — with the same guarantees, every rank rebuilt, 24 of 24
+in-flight requests completed, output identical across the round trip. The cause
+of that speed-up has not been isolated, so the v0.28.0 figures stand as the
+conservative ones.
+
 **In memory, dual-role capability costs at most 2.35% of a GPU.** Memory is not
 the only cost, however, and the other one is larger — see below.
 
@@ -174,6 +182,11 @@ Being precise about this matters more than the headline.
   with output identical across a round trip.
 - Survival under load — 24 of 24 in-flight requests completed across a switch.
 - The memory cost, measured rather than projected.
+- **That it survives upstream.** Re-verified against a vLLM roughly 580 commits
+  newer than the one it was built on, and against the original, on 8 × H200
+  each: the patch still applies cleanly, every rank still switches in both
+  directions, all 24 in-flight requests still complete, and output is still
+  identical. This is not pinned to a frozen snapshot of vLLM.
 - The KV *direction* flip — all ranks move from producer to consumer and back,
   and the connector tolerates the change while live.
 - **A real KV transfer between two engines, across a switch.** Two GLM-5.2
