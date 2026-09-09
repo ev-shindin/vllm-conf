@@ -264,7 +264,13 @@ python3 -c "import vllm.v1.engine.pd_role; print('pd_role OK')"
 
 Thirteen hunks. The `.rej` check above is the one that matters: seven of the
 nine patched files change under upstream regularly, so a base image that drifts
-from this branch's own base fails here rather than at runtime. Check `pd_role`
+from this branch's own base fails here rather than at runtime.
+
+That same churn applies to proposing this upstream. Three of the four changes
+prepared for submission conflict with current vLLM, in the shared MoE and engine
+files rather than in anything unique to this work — they rebase rather than
+need redesign, but rebase them shortly before submitting rather than months
+ahead. Check `pd_role`
 imports before launching — without it `/switch_pd_role` does not exist and the
 test below will fail at the first switch rather than at startup.
 

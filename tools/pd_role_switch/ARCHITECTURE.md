@@ -259,12 +259,6 @@ well: the switch is now measured against current vLLM as well as the version it
 was built on, so drift is something observed on a schedule rather than
 discovered during an incident.
 
-**The honest caveat.** Convergence brings churn. Upstream is actively changing
-the same files, and three of the four proposed changes already conflict with
-current vLLM — in the shared MoE and engine files, not in anything unique to
-this work. They rebase rather than redesign, but they have to be rebased shortly
-before they are proposed, not months earlier.
-
 ---
 
 ## 6. Why this matters commercially
