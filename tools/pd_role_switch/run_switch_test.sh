@@ -177,7 +177,10 @@ echo "############ RESULT ############"
 # are being shown and only claim a reproduction when the topology matches.
 if [ "$NODES" -gt 1 ]; then
   REF="published (2x8 H200, EP=16)"
-  REF_BUILD="1464-1587 ms"; REF_REUSE="378-387 ms"; REF_LOAD="4279 ms"
+  # Idle reuse is 797-799 ms in README.md; 378-387 ms was one unreproduced run
+  # and is not the published figure. Under load, the reference is the drain
+  # (wait) mode this script runs by default, not the 178 ms keep-mode figure.
+  REF_BUILD="1464-1587 ms"; REF_REUSE="797-799 ms"; REF_LOAD="7227 ms (wait)"
   REF_ONE="126257 MiB"; REF_BOTH="126543 MiB"; REF_RETAIN="286 MiB (at 128 tokens)"
 else
   REF="published (1x8 H200, EP=8)"

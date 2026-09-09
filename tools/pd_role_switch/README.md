@@ -10,8 +10,15 @@ rather than for peak-prefill plus peak-decode separately.
 
 ## Results
 
-Measured on 2 x 8 H200 (139.8 GiB), GLM-5.2-FP8, EP=16, vLLM v0.28.0,
-`gpu-memory-utilization` 0.90, `all2all-backend deepep_v2`.
+GLM-5.2-FP8, `gpu-memory-utilization` 0.90, `all2all-backend deepep_v2`, on two
+engine/image pairs. Every figure below names which one it came from:
+
+| short name | vLLM | this work |
+| --- | --- | --- |
+| **v0.28.0** | `vllm/vllm-openai:v0.28.0` | tag `pd-role-switch-v0.28.0` |
+| **current** | nightly `385dce36b` (~580 commits newer) | this branch |
+
+The section immediately below is **v0.28.0**, on 2 x 8 H200 (139.8 GiB), EP=16.
 
 ### Switch latency
 
@@ -25,6 +32,28 @@ before and after every round trip.
 
 Repeatability: 2 of 2 extra cycles switched all 16 ranks in both directions
 with matching output.
+
+### EP=16 on **current**, same two nodes
+
+The same test, same 2 x 8 H200 and byte-identical `run_switch_test.sh`, on
+**current**. `VLLM_PD_PAUSE_MODE` is unset in both, so both drain (`wait`).
+
+| | **v0.28.0** | **current** |
+| --- | --- | --- |
+| switch, fresh build | 1464–1587 ms | 1469 ms |
+| switch, reuse parked buffer | 797–799 ms | **52 ms** |
+| switch under load, `wait` | 7227 ms | 6834 ms |
+| in-flight requests completed | 24/24 | 24/24 |
+| retained buffer cost | 286 MiB | 286 MiB |
+| reuse switch allocation | 0 MiB | 0 MiB |
+| GPU0 used at boot | 126257 MiB | 121496 MiB |
+
+`PASS 16/16 ranks, 75 layers rebuilt` in both directions, and `PASS output
+identical across the round trip`.
+
+Fresh build, retained buffer cost and reuse allocation all land on the
+**v0.28.0** values, which is what makes the one row that moved worth believing:
+the instrument agrees with the older runs everywhere else.
 
 ### Intranode (EP=8, one node)
 
@@ -42,10 +71,10 @@ rebuilds 8/8 ranks across all 75 MoE layers in both directions.
 | reuse switch allocation | 0 MiB | 0 MiB |
 | GPU0 used at boot | 129454 MiB | 126380 MiB |
 
-The reuse switch is roughly 13x faster on the newer base. It reproduced across
-two runs on different nodes (49 ms and 50 ms), and the test script was
-byte-identical between the two pairs, so this is a difference between engines
-rather than between measurements.
+The reuse switch is roughly 13x faster on **current**. It has now reproduced
+three times — 49 ms and 50 ms here at EP=8 on different nodes, and 52 ms at
+EP=16 across two nodes over InfiniBand — with a byte-identical test script each
+time, so this is a difference between engines rather than between measurements.
 
 **Why is not established.** It lies somewhere in the ~580 upstream commits
 between the two bases, or in this branch rebuilding the kernel through

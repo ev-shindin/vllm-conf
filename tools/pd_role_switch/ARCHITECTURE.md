@@ -79,13 +79,17 @@ seconds** from node-local disk — and about 1355 seconds when two replicas shar
 one network volume. The switch is roughly three orders of magnitude cheaper than
 the alternative it replaces.
 
-The table above is vLLM v0.28.0 at expert parallelism 16. On a vLLM about 580
-commits newer, single node at expert parallelism 8, the switch is **faster**:
-onto a buffer held from before it takes **50 ms**, against 661 ms measured the
-same way on v0.28.0 — with the same guarantees, every rank rebuilt, 24 of 24
-in-flight requests completed, output identical across the round trip. The cause
-of that speed-up has not been isolated, so the v0.28.0 figures stand as the
-conservative ones.
+The table above is vLLM v0.28.0. Re-run on a vLLM about 580 commits newer, in
+**the same configuration** — the same two 8-GPU nodes, expert parallelism 16 —
+the switch onto a held buffer takes **52 ms** rather than 797–799 ms, while
+everything else lands on the older values: 1469 ms to build fresh, the same
+286 MiB to hold the spare buffer, 24 of 24 in-flight requests completed, output
+identical, all 16 ranks rebuilt in both directions. It is roughly 15x faster on
+the measurement that matters most, and the agreement everywhere else is what
+makes that one figure credible.
+
+The cause has not been isolated, so the v0.28.0 numbers stand as the
+conservative ones throughout this document.
 
 **In memory, dual-role capability costs at most 2.35% of a GPU.** Memory is not
 the only cost, however, and the other one is larger — see below.
