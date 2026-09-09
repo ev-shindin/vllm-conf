@@ -16,6 +16,23 @@ run does not reproduce the numbers in [README.md](README.md), start here.
 | `assert expert_start_loc.shape[0] == num_experts` | deep_gemm still selected | `VLLM_USE_DEEP_GEMM=0` **and** drop `--moe-backend` |
 | `ranks_switched: 0` with a fast, correct-looking response | the switch was a no-op | check the requested budget differs from the current one |
 | engine appears hung, pod still `Running` | the workers died; the wrapper outlives them | grep `hit an exception`, `Engine core initialization failed` |
+| `DeepEPv2 requires NCCL GIN` at load, every rank | container has no RDMA device | request `rdma/ib` — needed even on one node |
+| `TimeoutError: Timed out waiting for engine core processes to start` | weights slower than `VLLM_ENGINE_READY_TIMEOUT_S` (600 s) | load from node-local disk, and raise the variable |
+| a switch onto a held buffer costs ~650 ms | vLLM predates `039ea8266`; the DP pause waits 32 dummy steps | expected on that base, not a fault |
+
+## deepep_v2 needs an RDMA device, single node included
+
+Every rank fails at load with:
+
+```
+RuntimeError: DeepEPv2 requires NCCL GIN (GPU-Initiated Networking). This
+usually means IBGDA-capable InfiniBand NICs or drivers are not available.
+```
+
+`hybrid=1` selects which rank set GIN spans, not whether GIN is used, so a
+one-node run needs the device as much as a two-node one. Under Kubernetes that
+means requesting `rdma/ib` in both `requests` and `limits`; a pod that merely
+has GPUs will get this far and then stop.
 
 ## NCCL needs no pin; the CUDA major does need checking
 

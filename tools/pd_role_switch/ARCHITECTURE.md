@@ -88,8 +88,14 @@ identical, all 16 ranks rebuilt in both directions. It is roughly 15x faster on
 the measurement that matters most, and the agreement everywhere else is what
 makes that one figure credible.
 
-The cause has not been isolated, so the v0.28.0 numbers stand as the
-conservative ones throughout this document.
+The cause is upstream's, not ours. Changing role pauses every engine, and
+under data parallelism that pause needs the ranks to agree. Until September 2026
+they only checked for agreement once every 32 forward passes, so a switch spent
+about 640 ms running empty batches waiting for permission to proceed. vLLM now
+checks on the first pass. We inherited the improvement by moving to a newer
+vLLM; it costs us nothing to keep and cannot be lost through configuration.
+
+The v0.28.0 numbers stand as the conservative ones throughout this document.
 
 **In memory, dual-role capability costs at most 2.35% of a GPU.** Memory is not
 the only cost, however, and the other one is larger — see below.

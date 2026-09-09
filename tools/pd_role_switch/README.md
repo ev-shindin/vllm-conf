@@ -76,11 +76,34 @@ three times — 49 ms and 50 ms here at EP=8 on different nodes, and 52 ms at
 EP=16 across two nodes over InfiniBand — with a byte-identical test script each
 time, so this is a difference between engines rather than between measurements.
 
-**Why is not established.** It lies somewhere in the ~580 upstream commits
-between the two bases, or in this branch rebuilding the kernel through
-upstream's `_init_moe_kernel` rather than its own copy of that code. It has not
-been bisected, and until it is, the 277–656 ms range remains the right
-expectation for `v0.28.0`.
+**Why: the quiesce used to wait 32 dummy forward passes.** Switching a role
+pauses every EngineCore, and under data parallelism that pause needs consensus
+across DP ranks. Consensus is reached inside `_has_global_unfinished_reqs`,
+which until upstream's `039ea8266` (*[Core] Sync DP state on the first step of a
+wave*, #52957, 2026-09-06) only ran its all-reduce on a multiple of 32 steps:
+
+```python
+-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+-        if self.step_counter % 32 != 0:
++        # Sync step 1 too: an idle pause needs one dummy batch, not a full interval.
++        if self.step_counter != 1 and self.step_counter % self.dp_sync_interval != 0:
+```
+
+`step_counter` resets to 0 when a wave ends, so a switch arriving at an idle
+engine used to run 32 dummy batches before the ranks could agree they were
+paused. At roughly 20 ms a step that is ~640 ms, against the 653–661 ms measured
+on bases without the commit and 45–54 ms on bases with it.
+
+How this was established: five runs on **v0.28.0** and four published nightlies,
+which split cleanly into 653/661 ms without the commit and 45/50/52/54 ms with
+it, bisecting the ~580-commit gap to a 35-commit window that contains it — then
+reading the path. It is not an A/B of that one commit; no nightly exists at that
+granularity. The correlation, the mechanism and the arithmetic agree, which is
+the basis for naming it.
+
+Note the new `dp_sync_interval` knob (default 16) does **not** control this:
+step 1 syncs whatever the interval, so the improvement cannot be tuned away, and
+an older vLLM cannot be given it by configuration.
 
 What rules out the obvious artifact is that the switch is still doing the work.
 A switch that had degenerated into a no-op fails the ranks/layers check, and one
