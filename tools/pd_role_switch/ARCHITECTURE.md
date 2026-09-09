@@ -75,9 +75,17 @@ implementations holding two separate buffers, and switching means moving the
 layers from one to the other — which is only safe if both read weights in the
 same layout, so the switch has to check. In the newer `deepep_v2` a single
 buffer serves both roles and the backend never changes; what changes is the
-token budget the buffer is sized for. The second is what these measurements use
-and it supersedes the first, but the first remains a supported configuration
-upstream, so both paths are maintained.
+token budget the buffer is sized for.
+
+That difference decides more than tidiness. Two NVSHMEM buffers cannot be
+resident at once — `nvshmem::init` takes different team parameters for each — so
+across nodes the first path has to destroy the outgoing buffer before building
+the incoming one, and destroying it strands every captured CUDA graph. Internode
+Path A is therefore eager-only, and eager decode measured **4.9x slower**. The
+second path uses NCCL symmetric memory, where two buffers do coexist: nothing is
+destroyed, the graphs survive, and the switch becomes a swap. That is why every
+measurement in this document uses it — and why the first path is still
+maintained, since both backends remain supported upstream.
 
 ---
 

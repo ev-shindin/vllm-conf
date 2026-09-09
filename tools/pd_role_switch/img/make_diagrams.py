@@ -54,7 +54,7 @@ def solution_diagram(path):
     """What we added, where it lives, and why the switch has two paths."""
     fig, ax = plt.subplots(figsize=(15.5, 9.6), dpi=140)
     ax.set_xlim(0, 100)
-    ax.set_ylim(0, 62)
+    ax.set_ylim(-7.0, 62)
     ax.axis("off")
     fig.patch.set_facecolor(WHITE)
 
@@ -97,7 +97,7 @@ def solution_diagram(path):
     text(ax, 3.1, 34.0, "KV cache", size=10, color=MUTED)
     text(ax, 22.0, 34.0, "same layout in both roles", size=10)
     text(ax, 3.1, 32.1, "CUDA graphs", size=10, color=MUTED)
-    text(ax, 22.0, 32.1, "stay valid — the old buffer is parked", size=10)
+    text(ax, 22.0, 32.1, "valid wherever the old buffer can be parked", size=10)
 
     box(ax, 50.0, 30.6, 46.0, 9.4, face=PANEL, edge=LINE)
     text(ax, 51.1, 38.2, "pd_role.py resolves the role into three settings",
@@ -118,7 +118,7 @@ def solution_diagram(path):
          size=9.5, weight="bold", color=MUTED)
 
     # Path A
-    box(ax, 2.0, 9.6, 45.0, 16.4, face=WHITE, edge=INDIGO, lw=1.8)
+    box(ax, 2.0, 1.6, 45.0, 24.4, face=WHITE, edge=INDIGO, lw=1.8)
     text(ax, 3.2, 24.1, "PATH A  ·  the role IS the backend", size=12,
          weight="bold", color=INDIGO)
     text(ax, 3.2, 21.9, "deepep_high_throughput  ⇄  deepep_low_latency",
@@ -128,14 +128,20 @@ def solution_diagram(path):
          "buffers (1264 and 3226 MiB on H100). Switching means\n"
          "swapping which one the layers use.",
          size=9.5, color=MUTED, va="top")
-    text(ax, 3.2, 14.4, "So the switch must:", size=9.5, weight="bold")
-    text(ax, 3.2, 12.8,
+    text(ax, 3.2, 14.2, "So the switch must:", size=9.5, weight="bold")
+    text(ax, 3.2, 12.6,
          "•  check the two backends share a weight layout\n"
-         "•  park the outgoing buffer so CUDA graphs survive",
+         "•  park the outgoing buffer, where it can",
          size=9.5, color=MUTED, va="top")
+    text(ax, 3.2, 8.6,
+         "Across nodes it cannot. nvshmem::init takes different team\n"
+         "parameters per backend, so the two buffers cannot coexist and\n"
+         "the outgoing one must be destroyed — stranding every captured\n"
+         "CUDA graph. Internode Path A is eager-only: 4.9x slower decode.",
+         size=9.0, color=COPPER, va="top")
 
     # Path B
-    box(ax, 51.0, 9.6, 45.0, 16.4, face=WHITE, edge=COPPER, lw=1.8)
+    box(ax, 51.0, 1.6, 45.0, 24.4, face=WHITE, edge=COPPER, lw=1.8)
     text(ax, 52.2, 24.1, "PATH B  ·  one backend, both roles", size=12,
          weight="bold", color=COPPER)
     text(ax, 52.2, 21.9, "deepep_v2  →  deepep_v2", size=10.5, weight="bold")
@@ -144,11 +150,17 @@ def solution_diagram(path):
          "changes; what changes is the token budget it is sized\n"
          "for — 2048 for prefill, 128 for decode.",
          size=9.5, color=MUTED, va="top")
-    text(ax, 52.2, 14.4, "So the switch must:", size=9.5, weight="bold")
-    text(ax, 52.2, 12.8,
+    text(ax, 52.2, 14.2, "So the switch must:", size=9.5, weight="bold")
+    text(ax, 52.2, 12.6,
          "•  size the buffer for the INCOMING role's budget\n"
          "•  reuse a parked buffer when one already fits",
          size=9.5, color=MUTED, va="top")
+    text(ax, 52.2, 8.6,
+         "NCCL symmetric memory lets two ElasticBuffers coexist, so\n"
+         "nothing is destroyed and the graphs survive across nodes too.\n"
+         "That is why Path B exists, and why every measurement in this\n"
+         "document uses it.",
+         size=9.0, color=COPPER, va="top")
 
     # The buffer line fans out into the two paths. Both start from that line so
     # neither reads as descending from the "never touched" column.
@@ -156,10 +168,10 @@ def solution_diagram(path):
     arrow(ax, (73.0, 31.4), (73.5, 26.2), color=COPPER, lw=1.4)
 
     # ---- why both survive --------------------------------------------------
-    box(ax, 2.0, 2.0, 94.0, 6.2, face=PANEL, edge=LINE)
-    text(ax, 3.2, 6.4, "Both paths exist because vLLM still has both.",
+    box(ax, 2.0, -6.4, 94.0, 6.2, face=PANEL, edge=LINE)
+    text(ax, 3.2, -2.0, "Both paths exist because vLLM still has both.",
          size=11, weight="bold")
-    text(ax, 3.2, 4.0,
+    text(ax, 3.2, -4.4,
          "Path B supersedes Path A and is what these measurements use, but "
          "deepep_high_throughput and deepep_low_latency remain separate backends "
          "upstream, so a deployment\npinned to either still needs Path A. The two "
