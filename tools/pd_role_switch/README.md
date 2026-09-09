@@ -161,13 +161,21 @@ runs on. Both matter; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ### 1b. Put this branch into a stock image
 
-Only needed if you are running the published `vllm/vllm-openai:v0.28.0` image
-rather than an environment built from this branch.
+Only needed if you are running a published image rather than an environment
+built from this branch.
 
-**Do not copy the changed files in.** This branch is based on vLLM `main`, which
-has drifted past v0.28.0, so the nine MODIFIED files carry newer upstream code
-with them — `vllm/v1/engine/core.py` imports `resolve_kv_cache_layout`, which
-does not exist in v0.28.0, and every engine dies at init with an `ImportError`.
+**Pick a base image built from vLLM `main` on 2026-09-04 or later.** The
+injection patches nine existing files at their anchors, and one of those anchors
+is `_init_moe_kernel`, which vLLM gained that day in "Fast Start" (#54921). On
+an older base that hunk rejects. `vllm/vllm-openai:v0.28.0` is such a base: for
+that image use the tag `pd-role-switch-v0.28.0`, which is this work as it stood
+before the branch moved on to newer upstream, and which every measurement below
+was taken on.
+
+**Do not copy the changed files in.** The nine MODIFIED files carry upstream
+code with them, newer than any image whose vLLM predates this branch's base, and
+an engine that starts with a mismatched pair of them dies at init with an
+`ImportError` rather than at the point of the switch.
 
 Copy the four ADDED files whole, and PATCH the nine modified ones at their
 anchors:
@@ -187,9 +195,11 @@ git diff $BASE..HEAD -- $(git diff --diff-filter=M --name-only $BASE..HEAD -- vl
 python3 -c "import vllm.v1.engine.pd_role; print('pd_role OK')"
 ```
 
-Verified against v0.28.0: 13 hunks, 0 rejects. Check `pd_role` imports before
-launching — without it `/switch_pd_role` does not exist and the test below will
-fail at the first switch rather than at startup.
+Thirteen hunks. The `.rej` check above is the one that matters: seven of the
+nine patched files change under upstream regularly, so a base image that drifts
+from this branch's own base fails here rather than at runtime. Check `pd_role`
+imports before launching — without it `/switch_pd_role` does not exist and the
+test below will fail at the first switch rather than at startup.
 
 ### 2. Launch
 
