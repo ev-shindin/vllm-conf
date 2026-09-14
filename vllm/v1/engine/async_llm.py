@@ -1136,6 +1136,89 @@ class AsyncLLM(EngineClient):
             set_scaling_elastic_ep(False)
             raise
 
+    async def switch_pd_role(
+        self,
+        backend: str,
+        max_num_tokens: int | None = None,
+        max_num_batched_tokens: int | None = None,
+    ) -> dict:
+        """Move this engine between prefill and decode roles.
+
+        Runs in EngineCore because the scheduler half must: the token
+        budget is cached there at init and cannot be moved from a worker.
+
+        Fanned out to every EngineCore, not just ``core_engine``. The DeepEP
+        buffer rebuild is collective over the EP group, so a switch driven
+        through one data-parallel rank changes that rank alone on a single node
+        and deadlocks across nodes.
+        """
+        # Quiesce every core BEFORE the collective, then switch, then resume.
+        #
+        # Fanning the switch out is not sufficient on its own. The rebuild is a
+        # collective -- no rank returns until all have entered -- but the calls
+        # are delivered as independent per-engine messages, and under
+        # data parallelism the cores advance in lockstep through the DP
+        # coordinator. So the first core to dequeue can enter the barrier and
+        # block, which stalls the coordinator, which stops the remaining cores
+        # from ever dequeuing their own message. Rank 0 then waits forever for
+        # ranks that are waiting on rank 0.
+        #
+        # That is a race, not a constant failure: when all cores happen to
+        # dequeue inside the same coordinator gap the switch completes in
+        # ~440ms, and when one gets there first it hangs. Both were observed
+        # for the SAME call on a 2x8 run.
+        #
+        # DRAIN in-flight work before switching, rather than freezing it.
+        #
+        # "wait" sets PAUSED_NEW: new admissions are queued but the core KEEPS
+        # STEPPING, so requests already generating run to completion, and the
+        # returned Future completes once the engine is idle. "keep" sets
+        # PAUSED_ALL instead, which skips step() -- pending outputs flush but
+        # half-generated requests are frozen across the rebuild and resumed
+        # afterwards. Draining is the conservative choice: nothing is mid-flight
+        # while the DeepEP buffer is destroyed and rebuilt.
+        #
+        # This does not deadlock the way pause_scheduler(mode="wait") did when
+        # called from inside EngineCore: the utility RPC defers its reply via
+        # Future.add_done_callback (see EngineCoreProc._invoke_utility_method),
+        # so the engine loop keeps running and draining while the caller waits.
+        #
+        # The cost is switch latency bounded by the longest in-flight
+        # generation. Set VLLM_PD_PAUSE_MODE=keep for the old freeze-and-resume
+        # behaviour when that latency matters more than the guarantee.
+        #
+        # clear_cache stays False either way -- the prefix cache is unaffected
+        # by the switch and discarding it would be a needless cold start.
+        pause_mode = os.environ.get("VLLM_PD_PAUSE_MODE", "wait")
+        await self.engine_core.call_utility_all_async(
+            "pause_scheduler", pause_mode, False
+        )
+        try:
+            results = await self.engine_core.call_utility_all_async(
+                "switch_pd_role",
+                backend,
+                max_num_tokens,
+                max_num_batched_tokens,
+            )
+        finally:
+            # Resume even if the switch failed, or a refusal would leave the
+            # whole job parked and serving nothing.
+            await self.engine_core.call_utility_all_async("resume_scheduler")
+        if len(results) == 1:
+            return results[0]
+        # layers_switched is per rank and identical across them, so report it
+        # as-is rather than summed; ranks_switched is what says whether the
+        # whole job moved or only part of it did.
+        return {
+            "backend": backend,
+            "ranks_switched": sum(1 for r in results if r.get("layers_switched")),
+            "ranks_total": len(results),
+            "layers_switched": max(
+                (r.get("layers_switched", 0) for r in results), default=0
+            ),
+            "per_rank": results,
+        }
+
     async def scale_elastic_ep(
         self, new_data_parallel_size: int, drain_timeout: int = 300
     ):

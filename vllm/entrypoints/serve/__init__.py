@@ -58,6 +58,10 @@ def register_vllm_dev_api_routers(app: FastAPI):
 
     attach_rpc_router(app)
 
+    from .dev.pd_role.api_router import attach_router as attach_pd_role_router
+
+    attach_pd_role_router(app)
+
     from .dev.server_info.api_router import (
         attach_router as attach_server_info_router,
     )

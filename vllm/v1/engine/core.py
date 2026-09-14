@@ -868,6 +868,28 @@ class EngineCore:
 
         return None
 
+    def switch_pd_role(
+        self,
+        backend: str,
+        max_num_tokens: int | None = None,
+        max_num_batched_tokens: int | None = None,
+    ) -> dict:
+        """Move this engine between prefill and decode roles.
+
+        Reachable over the UTILITY RPC as call_utility("switch_pd_role", ...).
+        The scheduler half has to happen here -- the workers cannot lower a
+        budget this process caches -- so this drives both halves in order.
+        See vllm/v1/engine/pd_role.py.
+        """
+        from vllm.v1.engine.pd_role import switch_pd_role
+
+        return switch_pd_role(
+            self,
+            backend,
+            max_num_tokens=max_num_tokens,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
+
     def resume_scheduler(self) -> None:
         """Resume the scheduler and flush any requests queued while paused."""
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
