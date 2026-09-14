@@ -13,6 +13,17 @@ rather than for peak-prefill plus peak-decode separately.
 GLM-5.2-FP8, `gpu-memory-utilization` 0.90, `all2all-backend deepep_v2`, on two
 engine/image pairs. Every figure below names which one it came from:
 
+**Model.** Every figure here is **GLM-5.2-FP8**, which is what
+`run_switch_test.sh` defaults to — the default and the reference table have to
+name the same model or a re-run compares against numbers from another one.
+
+Production serves **GLM-5.3**, and the evaluation plan uses it. The two are
+identical in every field that affects this work: 78 layers, `first_k_dense_replace`
+3 (so 75 MoE layers), 256 experts top-8, `kv_lora_rank` 512, `qk_rope_head_dim`
+64, hidden 6144, 1M context, fp8. Nothing in the harness is model-specific — the
+rank and layer counts come from the switch response, not from a constant — so
+run it against 5.3 with `MODEL=zai-org/GLM-5.3`, and label the results as such.
+
 | short name | vLLM | this work |
 | --- | --- | --- |
 | **v0.28.0** | `vllm/vllm-openai:v0.28.0` | tag `pd-role-switch-v0.28.0` |
